@@ -996,6 +996,10 @@ export interface PluginAgentSessionsClient {
     prompt: string;
     reason?: string;
     onEvent?: (event: AgentSessionEvent) => void;
+    contentBlocks?: Array<
+      | { type: "text"; text: string }
+      | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
+    >;
   }): Promise<AgentSessionSendResult>;
 
   /** Close a session, releasing resources. Requires `agent.sessions.close`. */

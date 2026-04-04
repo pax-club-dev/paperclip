@@ -404,10 +404,53 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+
+  // Extract contentBlocks (images + text) from context if present
+  const contentBlocks = Array.isArray(context.contentBlocks) ? context.contentBlocks : [];
+  const imageFiles: string[] = [];
+  if (contentBlocks.length > 0) {
+    let imgIdx = 0;
+    for (const block of contentBlocks) {
+      if (
+        block &&
+        typeof block === "object" &&
+        (block as Record<string, unknown>).type === "image"
+      ) {
+        const source = (block as Record<string, unknown>).source as
+          | { type: string; media_type?: string; data?: string }
+          | undefined;
+        if (source?.type === "base64" && source.data) {
+          const ext =
+            source.media_type === "image/png"
+              ? ".png"
+              : source.media_type === "image/gif"
+                ? ".gif"
+                : source.media_type === "image/webp"
+                  ? ".webp"
+                  : ".jpg";
+          const imgPath = path.join(skillsDir, `attachment-${imgIdx}${ext}`);
+          await fs.writeFile(imgPath, Buffer.from(source.data, "base64"));
+          imageFiles.push(imgPath);
+          imgIdx++;
+        }
+      }
+    }
+  }
+
+  // If there are image attachments, append instructions to view them
+  let imagePromptSuffix = "";
+  if (imageFiles.length > 0) {
+    const fileList = imageFiles.map((f) => f).join("\n");
+    imagePromptSuffix =
+      `\n\nThe user sent ${imageFiles.length} image attachment(s). ` +
+      `IMPORTANT: Before responding, use the Read tool to view each image file listed below. ` +
+      `These are image files that you can see:\n${fileList}`;
+  }
+
   const prompt = joinPromptSections([
     renderedBootstrapPrompt,
     sessionHandoffNote,
-    renderedPrompt,
+    renderedPrompt + imagePromptSuffix,
   ]);
   const promptMetrics = {
     promptChars: prompt.length,
