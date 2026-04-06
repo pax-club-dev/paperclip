@@ -300,3 +300,10 @@ export {
   type SetPluginState,
   type ListPluginState,
 } from "./plugin.js";
+
+export {
+  createSteeringDirectiveSchema,
+  updateSteeringDirectiveSchema,
+  type CreateSteeringDirective,
+  type UpdateSteeringDirective,
+} from "./steering-directive.js";
