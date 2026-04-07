@@ -45,6 +45,7 @@ import {
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { composeDirectives, formatDirectivesAsMarkdown } from "./steering-directives.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService } from "./workspace-operations.js";
 import {
@@ -2855,6 +2856,24 @@ export function heartbeatService(db: Db) {
           payload: meta as unknown as Record<string, unknown>,
         });
       };
+
+      // Compose steering directives into heartbeat context
+      try {
+        const directives = await composeDirectives(db, {
+          companyId: agent.companyId,
+          projectId: readNonEmptyString(context.projectId) ?? null,
+          agentId: agent.id,
+          issueId: readNonEmptyString(context.issueId) ?? null,
+        });
+        if (directives.length > 0) {
+          context.paperclipSteeringDirectives = formatDirectivesAsMarkdown(directives);
+        }
+      } catch (steeringErr) {
+        logger.warn(
+          { runId: run.id, agentId: agent.id, err: steeringErr },
+          "Failed to load steering directives; continuing without them",
+        );
+      }
 
       const adapter = getServerAdapter(agent.adapterType);
       const authToken = adapter.supportsLocalAgentJwt
