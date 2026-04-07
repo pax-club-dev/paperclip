@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -2618,6 +2619,7 @@ export function heartbeatService(db: Db) {
           ]
         : []),
     ];
+    const instanceRoot = resolvePaperclipInstanceRoot();
     context.paperclipWorkspace = {
       cwd: executionWorkspace.cwd,
       source: executionWorkspace.source,
@@ -2634,7 +2636,9 @@ export function heartbeatService(db: Db) {
         await fs.mkdir(home, { recursive: true });
         return home;
       })(),
-      instanceRoot: resolvePaperclipInstanceRoot(),
+      instanceRoot,
+      companyDir: path.resolve(instanceRoot, "companies", agent.companyId),
+      homeDir: os.homedir(),
     };
     context.paperclipWorkspaces = resolvedWorkspace.workspaceHints;
     const runtimeServiceIntents = (() => {

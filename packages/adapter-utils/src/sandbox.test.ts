@@ -88,9 +88,9 @@ describe("bwrap args structure", () => {
     expect(result.args[roBindIdx + 2]).toBe("/");
   });
 
-  it("hides secrets, db, and workspaces with tmpfs", () => {
+  it("hides all sensitive paths with tmpfs", () => {
     const result = wrapWithSandbox(
-      baseSandboxConfig(),
+      baseSandboxConfig({ homeDir: "/home/test" }),
       "claude",
       ["--print"],
     );
@@ -102,10 +102,30 @@ describe("bwrap args structure", () => {
     });
     const tmpfsPaths = tmpfsIndexes.map((i) => result.args[i + 1]);
 
-    expect(tmpfsPaths).toContain("/home/test/.paperclip/instances/default/secrets");
-    expect(tmpfsPaths).toContain("/home/test/.paperclip/instances/default/db");
-    expect(tmpfsPaths).toContain("/home/test/.paperclip/instances/default/workspaces");
+    const root = "/home/test/.paperclip/instances/default";
+
+    // Original Phase 1 paths
+    expect(tmpfsPaths).toContain(`${root}/secrets`);
+    expect(tmpfsPaths).toContain(`${root}/db`);
+    expect(tmpfsPaths).toContain(`${root}/workspaces`);
     expect(tmpfsPaths).toContain("/tmp");
+
+    // Critical: JWT secret and config
+    expect(tmpfsPaths).toContain(`${root}/.env`);
+    expect(tmpfsPaths).toContain(`${root}/config.json`);
+
+    // High: cross-company, database backups
+    expect(tmpfsPaths).toContain(`${root}/companies`);
+    expect(tmpfsPaths).toContain(`${root}/data`);
+
+    // Medium: operational data
+    expect(tmpfsPaths).toContain(`${root}/logs`);
+    expect(tmpfsPaths).toContain(`${root}/telemetry`);
+    expect(tmpfsPaths).toContain(`${root}/runtime-services`);
+
+    // User-level sensitive dirs
+    expect(tmpfsPaths).toContain("/home/test/.ssh");
+    expect(tmpfsPaths).toContain("/home/test/.config");
   });
 
   it("re-mounts agent workspace read-write", () => {
@@ -197,6 +217,52 @@ describe("bwrap args structure", () => {
     expect(result.args[separatorIdx + 1]).toBe("claude");
     expect(result.args[separatorIdx + 2]).toBe("--print");
     expect(result.args[separatorIdx + 3]).toBe("-");
+  });
+
+  it("re-mounts agent company directory read-only when companyDir is set", () => {
+    const companyDir = "/home/test/.paperclip/instances/default/companies/company-xyz";
+    const result = wrapWithSandbox(
+      baseSandboxConfig({ companyDir }),
+      "claude",
+      ["--print"],
+    );
+    if (result.command !== "bwrap") return;
+
+    // companies/ should be hidden with tmpfs
+    const tmpfsIndexes: number[] = [];
+    result.args.forEach((arg, i) => {
+      if (arg === "--tmpfs") tmpfsIndexes.push(i);
+    });
+    const tmpfsPaths = tmpfsIndexes.map((i) => result.args[i + 1]);
+    expect(tmpfsPaths).toContain("/home/test/.paperclip/instances/default/companies");
+
+    // agent's own company dir should be re-mounted read-only
+    const roPaths: string[] = [];
+    result.args.forEach((arg, i) => {
+      if (arg === "--ro-bind") roPaths.push(result.args[i + 1]!);
+    });
+    expect(roPaths).toContain(companyDir);
+  });
+
+  it("skips homeDir tmpfs overlays when homeDir is not set", () => {
+    const result = wrapWithSandbox(
+      baseSandboxConfig(),
+      "claude",
+      ["--print"],
+    );
+    if (result.command !== "bwrap") return;
+
+    const tmpfsIndexes: number[] = [];
+    result.args.forEach((arg, i) => {
+      if (arg === "--tmpfs") tmpfsIndexes.push(i);
+    });
+    const tmpfsPaths = tmpfsIndexes.map((i) => result.args[i + 1]);
+
+    // Should not contain any .ssh or .config paths when homeDir is unset
+    const homeSensitivePaths = tmpfsPaths.filter(
+      (p) => p?.endsWith("/.ssh") || p?.endsWith("/.config"),
+    );
+    expect(homeSensitivePaths).toHaveLength(0);
   });
 
   it("includes PID namespace isolation and die-with-parent", () => {

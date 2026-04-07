@@ -461,11 +461,19 @@ export function buildSandboxConfig(
     additionalRwPaths.push(worktreePath);
   }
 
+  // Company directory: agent's own company dir under ${instanceRoot}/companies/
+  const companyDir = asString(workspace.companyDir, "");
+
+  // Home directory: used to hide ~/.ssh and ~/.config
+  const homeDir = asString(workspace.homeDir, "");
+
   return {
     enabled: true,
     instanceRoot,
     agentWorkspace: agentHome,
     cwd,
+    homeDir: homeDir || undefined,
+    companyDir: companyDir || undefined,
     additionalRwPaths: additionalRwPaths.length > 0 ? additionalRwPaths : undefined,
     additionalRoPaths: additionalRoPaths.length > 0 ? additionalRoPaths : undefined,
     fallback: asString(config.filesystemSandboxFallback, "warn") as "refuse" | "warn",
