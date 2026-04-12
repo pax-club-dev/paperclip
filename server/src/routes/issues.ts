@@ -343,10 +343,11 @@ export function issueRoutes(
     const assigneeFilter = req.query.assigneeAgentId as string | undefined;
     const priorityFilter = req.query.priority as string | undefined;
 
-    // Fetch all issues for the company
-    let allIssues = await svc.list(companyId, {
+    // Fetch all issues for the company (normalize paginated response to array)
+    const listResult = await svc.list(companyId, {
       includeRoutineExecutions: false,
     });
+    let allIssues = Array.isArray(listResult) ? listResult : listResult.items;
 
     // Apply optional filters for the graph view
     if (statusFilter) {

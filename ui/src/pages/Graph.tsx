@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -128,11 +128,12 @@ type IssueNodeData = DependencyGraphNode & {
   searchMatch?: boolean;
 };
 
-function IssueNode({ data, selected }: NodeProps<Node<IssueNodeData>>) {
+const IssueNode = memo(function IssueNode({ data, selected }: NodeProps<Node<IssueNodeData>>) {
   const colors = STATUS_COLORS[data.status] ?? DEFAULT_STATUS_COLOR;
   const priorityDef = data.priority ? PRIORITY_ICONS[data.priority] : null;
-  const initials = data.assigneeAgent
-    ? data.assigneeAgent.name
+  const agentName = data.assigneeAgent?.name;
+  const initials = agentName
+    ? agentName
         .split(".")
         .map((s: string) => s[0])
         .join("")
@@ -155,8 +156,8 @@ function IssueNode({ data, selected }: NodeProps<Node<IssueNodeData>>) {
           height: NODE_HEIGHT,
           borderColor: selected ? colors.border : "var(--border)",
           backgroundColor: colors.bg,
-          ringColor: selected ? colors.border : undefined,
-        }}
+          '--tw-ring-color': selected ? colors.border : undefined,
+        } as React.CSSProperties}
       >
         {/* Status bar */}
         <div className="w-1 shrink-0" style={{ backgroundColor: colors.bar }} />
@@ -193,7 +194,7 @@ function IssueNode({ data, selected }: NodeProps<Node<IssueNodeData>>) {
       <Handle type="source" position={Position.Right} className="!w-2 !h-2 !bg-muted-foreground !border-none" />
     </>
   );
-}
+});
 
 const nodeTypes: NodeTypes = {
   issue: IssueNode,
@@ -217,6 +218,8 @@ export function Graph() {
 
   // Filter state
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const searchRef = useRef<HTMLInputElement>(null);
   const [statusFilter, setStatusFilter] = useState<string>("active");
   const [priorityFilter, setPriorityFilter] = useState<string>("all");
   const [assigneeFilter, setAssigneeFilter] = useState<string>("all");
@@ -224,6 +227,12 @@ export function Graph() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(
     searchParams.get("focus") ?? null,
   );
+
+  // Debounce search input (250ms)
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search), 250);
+    return () => clearTimeout(timer);
+  }, [search]);
 
   // Fetch graph data
   const statusParam = statusFilter === "active"
@@ -302,7 +311,7 @@ export function Graph() {
     }));
 
     // Search highlighting
-    const searchLower = search.toLowerCase().trim();
+    const searchLower = debouncedSearch.toLowerCase().trim();
 
     // Build flow nodes
     const rawNodes: Node[] = graphData.nodes.map((n) => {
@@ -335,7 +344,7 @@ export function Graph() {
       nodeMap,
       edgesByNode,
     };
-  }, [graphData, showResolved, search]);
+  }, [graphData, showResolved, debouncedSearch]);
 
   // React Flow state
   const [nodes, setNodes, onNodesChange] = useNodesState(flowNodes);
@@ -364,11 +373,16 @@ export function Graph() {
       if (e.key === "Escape") setSelectedNodeId(null);
       if (e.key === "/" && !e.ctrlKey && !e.metaKey) {
         e.preventDefault();
-        document.getElementById("graph-search")?.focus();
+        searchRef.current?.focus();
       }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  const miniMapNodeColor = useCallback((node: Node) => {
+    const status = (node.data as IssueNodeData)?.status;
+    return (STATUS_COLORS[status] ?? DEFAULT_STATUS_COLOR).bar;
   }, []);
 
   if (!selectedCompanyId) {
@@ -422,7 +436,7 @@ export function Graph() {
         <div className="relative">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
           <Input
-            id="graph-search"
+            ref={searchRef}
             placeholder="Search nodes..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -524,10 +538,7 @@ export function Graph() {
               className="!bg-card !border-border !shadow-sm [&>button]:!bg-card [&>button]:!border-border [&>button]:!text-foreground [&>button:hover]:!bg-accent"
             />
             <MiniMap
-              nodeColor={(node) => {
-                const status = (node.data as IssueNodeData)?.status;
-                return (STATUS_COLORS[status] ?? DEFAULT_STATUS_COLOR).bar;
-              }}
+              nodeColor={miniMapNodeColor}
               maskColor="rgba(0,0,0,0.3)"
               className="!bg-card !border-border !shadow-sm"
               pannable
