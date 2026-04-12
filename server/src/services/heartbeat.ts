@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
@@ -14,6 +14,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueRelations,
   issues,
   projects,
   projectWorkspaces,
@@ -791,6 +792,13 @@ function enrichWakeContextSnapshot(input: {
   }
   if (!readNonEmptyString(contextSnapshot["wakeTriggerDetail"]) && triggerDetail) {
     contextSnapshot.wakeTriggerDetail = triggerDetail;
+  }
+  // Plugin session messages (e.g. Signal) pass the user's message text via
+  // payload.prompt.  Carry it forward in the snapshot so that the adapter can
+  // surface it even when there are no issue comments to render.
+  const promptFromPayload = readNonEmptyString(payload?.["prompt"]);
+  if (promptFromPayload && !readNonEmptyString(contextSnapshot["prompt"])) {
+    contextSnapshot.prompt = promptFromPayload;
   }
 
   return {
@@ -2035,6 +2043,83 @@ export function heartbeatService(db: Db) {
         },
       });
     }
+
+    if (nextStatus === "idle") {
+      await autoWakeIdleAgentIfAssignableWork(agentId).catch((err) => {
+        logger.warn(
+          { err, agentId },
+          "failed to auto-wake idle agent with assignable work",
+        );
+      });
+    }
+  }
+
+  // Returns true if the agent has at least one todo issue assigned to it with
+  // no execution lock and no unresolved blocker. Used to decide whether an
+  // idle agent should be immediately re-woken instead of waiting for its next
+  // timer tick.
+  async function autoWakeIdleAgentIfAssignableWork(agentId: string) {
+    const assignable = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.assigneeAgentId, agentId),
+          eq(issues.status, "todo"),
+          sql`${issues.executionRunId} IS NULL`,
+          sql`NOT EXISTS (
+            SELECT 1 FROM ${issueRelations} r
+            INNER JOIN ${issues} b ON b.id = r.issue_id
+            WHERE r.related_issue_id = ${issues.id}
+              AND r.type = 'blocks'
+              AND b.status NOT IN ('done', 'cancelled')
+          )`,
+        ),
+      )
+      .limit(1);
+
+    if (assignable.length === 0) return;
+
+    await enqueueWakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "system",
+      reason: "idle_agent_has_assignable_work",
+      requestedByActorType: "system",
+      requestedByActorId: null,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Stale execution lock cleanup on terminal issues
+  //
+  // Done/cancelled issues should never hold an execution lock — the run is
+  // over.  PAX-413 patches prevent new stale locks, but existing cruft
+  // (PAX-411) and any future race-condition leftovers need periodic cleanup.
+  // ---------------------------------------------------------------------------
+  async function clearTerminalIssueLocks() {
+    const result = await db
+      .update(issues)
+      .set({
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          inArray(issues.status, ["done", "cancelled"]),
+          sql`${issues.executionRunId} IS NOT NULL`,
+        ),
+      )
+      .returning({ id: issues.id, identifier: issues.identifier });
+
+    if (result.length > 0) {
+      logger.info(
+        { cleared: result.length, identifiers: result.map((r) => r.identifier) },
+        "clearTerminalIssueLocks: cleared stale execution locks on terminal issues",
+      );
+    }
+    return { cleared: result.length };
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
@@ -2135,6 +2220,1579 @@ export function heartbeatService(db: Db) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
     return { reaped: reaped.length, runIds: reaped };
+  }
+
+  // Watchdog: any non-terminal run older than the 10-minute task rule gets
+  // escalated to the COO as a fresh issue. Deduped by (originKind='watchdog',
+  // originId='run:{runId}') so subsequent ticks won't re-file for the same run.
+  async function sweepStuckRuns() {
+    const STUCK_THRESHOLD_MS = 10 * 60 * 1000;
+    const cutoff = new Date(Date.now() - STUCK_THRESHOLD_MS);
+
+    const stuck = await db
+      .select({
+        runId: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        invocationSource: heartbeatRuns.invocationSource,
+        createdAt: heartbeatRuns.createdAt,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        agentName: agents.name,
+        agentRole: agents.role,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(
+        and(
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+          lt(heartbeatRuns.createdAt, cutoff),
+          sql`${agents.role} <> 'coo'`,
+        ),
+      );
+
+    if (stuck.length === 0) return { filed: 0, skipped: 0 };
+
+    const originIds = stuck.map((s) => `run:${s.runId}`);
+    const existing = await db
+      .select({ originId: issues.originId })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.originKind, "watchdog"),
+          inArray(issues.originId, originIds),
+          sql`${issues.status} NOT IN ('done', 'cancelled')`,
+        ),
+      );
+    const alreadyAlerted = new Set(existing.map((e) => e.originId));
+
+    const cooByCompany = new Map<string, string>();
+    async function findCoo(companyId: string): Promise<string | null> {
+      const cached = cooByCompany.get(companyId);
+      if (cached) return cached;
+      const row = await db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(
+          and(
+            eq(agents.companyId, companyId),
+            eq(agents.role, "coo"),
+            sql`${agents.status} NOT IN ('terminated', 'paused', 'pending_approval')`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!row) return null;
+      cooByCompany.set(companyId, row.id);
+      return row.id;
+    }
+
+    let filed = 0;
+    let skipped = 0;
+    const issueSvc = issueService(db);
+    for (const s of stuck) {
+      if (alreadyAlerted.has(`run:${s.runId}`)) {
+        skipped += 1;
+        continue;
+      }
+      const cooId = await findCoo(s.companyId);
+      if (!cooId) {
+        skipped += 1;
+        continue;
+      }
+      const ageMinutes = Math.max(
+        1,
+        Math.floor((Date.now() - new Date(s.createdAt).getTime()) / 60000),
+      );
+      const ctx = (s.contextSnapshot as Record<string, unknown> | null) ?? {};
+      const linkedIssueId = typeof ctx.issueId === "string" ? ctx.issueId : null;
+      const shortRunId = s.runId.slice(0, 8);
+      const title = `Watchdog: ${s.agentName} run ${shortRunId} ${s.status} for ${ageMinutes}m`;
+      const description = [
+        `Heartbeat run for **${s.agentName}** has been \`${s.status}\` for **${ageMinutes} minutes**, exceeding the 10-minute task rule.`,
+        ``,
+        `**Run**: \`${s.runId}\``,
+        `**Agent**: ${s.agentName} (\`${s.agentId}\`)`,
+        `**Status**: ${s.status}`,
+        `**Invocation source**: ${s.invocationSource}`,
+        `**Created at**: ${new Date(s.createdAt).toISOString()}`,
+        linkedIssueId ? `**Linked issue**: \`${linkedIssueId}\`` : null,
+        ``,
+        `**Action**: investigate why this run is not progressing. Options:`,
+        `- Wait if this is legitimately long-running work`,
+        `- Cancel via \`POST /api/heartbeat-runs/${s.runId}/cancel\` and requeue a smaller slice`,
+        `- Reassign the underlying task if the agent is stuck`,
+        ``,
+        `_Auto-filed by the watchdog sweeper. Dedup: originKind=watchdog, originId=run:${s.runId}._`,
+      ]
+        .filter((line) => line !== null)
+        .join("\n");
+
+      try {
+        const created = await issueSvc.create(s.companyId, {
+          title,
+          description,
+          priority: "high",
+          status: "todo",
+          assigneeAgentId: cooId,
+          originKind: "watchdog",
+          originId: `run:${s.runId}`,
+        });
+        filed += 1;
+        logger.warn(
+          {
+            runId: s.runId,
+            agentId: s.agentId,
+            agentName: s.agentName,
+            ageMinutes,
+            watchdogIssueId: created.id,
+            watchdogIssueIdentifier: created.identifier,
+            cooId,
+          },
+          "watchdog: filed COO alert for stuck run",
+        );
+        await enqueueWakeup(cooId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId: created.id, mutation: "create" },
+          requestedByActorType: "system",
+          requestedByActorId: "watchdog_sweeper",
+          contextSnapshot: { issueId: created.id, source: "watchdog" },
+        }).catch((err) => {
+          logger.warn(
+            { err, watchdogIssueId: created.id, cooId },
+            "watchdog: failed to wake COO after filing alert",
+          );
+        });
+      } catch (err) {
+        logger.warn(
+          { err, runId: s.runId },
+          "watchdog: failed to file COO alert for stuck run",
+        );
+      }
+    }
+
+    if (filed > 0) {
+      logger.warn(
+        { filed, skipped, stuckCount: stuck.length },
+        "watchdog: stuck-run sweep filed new COO alerts",
+      );
+    }
+    return { filed, skipped };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Blocking-chain-aware prioritization sweep
+  //
+  // Walks the issue_relations graph per company, identifies root blockers
+  // (issues that transitively block the most open work and are themselves
+  // actionable), escalates their priority, and files COO alerts so the
+  // orchestrator knows where to focus.  Also detects circular blocking.
+  // ---------------------------------------------------------------------------
+  const OPEN_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
+  const TERMINAL_STATUSES = new Set(["done", "cancelled"]);
+  const ROOT_BLOCKER_MIN_FANOUT = 2;
+
+  async function sweepBlockingChains() {
+    const companyRows = await db
+      .selectDistinct({ companyId: issues.companyId })
+      .from(issues)
+      .where(inArray(issues.status, OPEN_STATUSES));
+
+    let escalated = 0;
+    let cyclesDetected = 0;
+    let skipped = 0;
+
+    for (const { companyId } of companyRows) {
+      // 1. Load full blocking graph + issue metadata for this company
+      const edges = await db
+        .select({
+          blockerId: issueRelations.issueId,
+          blockedId: issueRelations.relatedIssueId,
+        })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.type, "blocks"),
+          ),
+        );
+
+      if (edges.length === 0) continue;
+
+      const allIssueIds = new Set<string>();
+      for (const e of edges) {
+        allIssueIds.add(e.blockerId);
+        allIssueIds.add(e.blockedId);
+      }
+
+      const issueMeta = await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          title: issues.title,
+          status: issues.status,
+          priority: issues.priority,
+          assigneeAgentId: issues.assigneeAgentId,
+          originKind: issues.originKind,
+          originId: issues.originId,
+        })
+        .from(issues)
+        .where(inArray(issues.id, [...allIssueIds]));
+
+      const issueMap = new Map(issueMeta.map((i) => [i.id, i]));
+
+      // 2. Build adjacency lists (blocker → blocked[], blocked → blocker[])
+      const blockerToBlocked = new Map<string, string[]>();
+      const blockedToBlockers = new Map<string, string[]>();
+
+      for (const e of edges) {
+        const blocker = issueMap.get(e.blockerId);
+        const blocked = issueMap.get(e.blockedId);
+        // Only count edges where blocked issue is open (done/cancelled blockers are irrelevant)
+        if (!blocker || !blocked) continue;
+        if (TERMINAL_STATUSES.has(blocker.status)) continue;
+        if (TERMINAL_STATUSES.has(blocked.status)) continue;
+
+        const fwd = blockerToBlocked.get(e.blockerId) ?? [];
+        fwd.push(e.blockedId);
+        blockerToBlocked.set(e.blockerId, fwd);
+
+        const rev = blockedToBlockers.get(e.blockedId) ?? [];
+        rev.push(e.blockerId);
+        blockedToBlockers.set(e.blockedId, rev);
+      }
+
+      // 3. Detect cycles via Kahn's algorithm (topological sort)
+      const inDegree = new Map<string, number>();
+      for (const [id] of blockerToBlocked) {
+        if (!inDegree.has(id)) inDegree.set(id, 0);
+      }
+      for (const [id, blockers] of blockedToBlockers) {
+        inDegree.set(id, blockers.length);
+        if (!blockerToBlocked.has(id) && !inDegree.has(id)) {
+          // leaf — only appears as blocked
+        }
+      }
+      // Ensure all nodes in the live graph are in inDegree
+      for (const id of [...blockerToBlocked.keys(), ...blockedToBlockers.keys()]) {
+        if (!inDegree.has(id)) inDegree.set(id, 0);
+      }
+
+      const queue: string[] = [];
+      for (const [id, deg] of inDegree) {
+        if (deg === 0) queue.push(id);
+      }
+      const sorted: string[] = [];
+      while (queue.length > 0) {
+        const node = queue.shift()!;
+        sorted.push(node);
+        for (const child of blockerToBlocked.get(node) ?? []) {
+          const newDeg = (inDegree.get(child) ?? 1) - 1;
+          inDegree.set(child, newDeg);
+          if (newDeg === 0) queue.push(child);
+        }
+      }
+
+      const allGraphNodes = new Set([...blockerToBlocked.keys(), ...blockedToBlockers.keys()]);
+      const inCycle = new Set<string>();
+      for (const id of allGraphNodes) {
+        if (!sorted.includes(id)) inCycle.add(id);
+      }
+
+      // 4. Compute transitive fan-out for each blocker (BFS forward)
+      const fanOut = new Map<string, number>();
+      for (const root of blockerToBlocked.keys()) {
+        const visited = new Set<string>();
+        const bfsQueue = [...(blockerToBlocked.get(root) ?? [])];
+        while (bfsQueue.length > 0) {
+          const cur = bfsQueue.shift()!;
+          if (visited.has(cur)) continue;
+          visited.add(cur);
+          bfsQueue.push(...(blockerToBlocked.get(cur) ?? []));
+        }
+        fanOut.set(root, visited.size);
+      }
+
+      // 5. Identify root blockers: not blocked by any open issue, fan-out ≥ threshold
+      const rootBlockers: Array<{
+        id: string;
+        identifier: string | null;
+        title: string;
+        status: string;
+        priority: string;
+        assigneeAgentId: string | null;
+        fanOut: number;
+      }> = [];
+
+      for (const [id, fo] of fanOut) {
+        if (fo < ROOT_BLOCKER_MIN_FANOUT) continue;
+        const meta = issueMap.get(id);
+        if (!meta) continue;
+        if (TERMINAL_STATUSES.has(meta.status)) continue;
+        // A root blocker has no open blockers of its own
+        const ownBlockers = blockedToBlockers.get(id) ?? [];
+        const hasOpenBlocker = ownBlockers.some((bid) => {
+          const bm = issueMap.get(bid);
+          return bm && !TERMINAL_STATUSES.has(bm.status);
+        });
+        if (hasOpenBlocker) continue;
+        rootBlockers.push({ ...meta, fanOut: fo });
+      }
+
+      // Sort by fan-out descending — most impactful first
+      rootBlockers.sort((a, b) => b.fanOut - a.fanOut);
+
+      // 6. Look up COO for this company
+      const cooRow = await db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(
+          and(
+            eq(agents.companyId, companyId),
+            eq(agents.role, "coo"),
+            sql`${agents.status} NOT IN ('terminated', 'paused', 'pending_approval')`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (!cooRow) continue;
+      const cooId = cooRow.id;
+
+      // 7. Check existing alerts to avoid duplicates
+      const originIds = [
+        ...rootBlockers.map((rb) => `blocker:${rb.id}`),
+        ...(inCycle.size > 0 ? [`cycle:${companyId}`] : []),
+      ];
+
+      const existingAlerts = originIds.length > 0
+        ? await db
+            .select({ originId: issues.originId })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.originKind, "watchdog"),
+                inArray(issues.originId, originIds),
+                sql`${issues.status} NOT IN ('done', 'cancelled')`,
+              ),
+            )
+        : [];
+
+      const alreadyAlerted = new Set(existingAlerts.map((e) => e.originId));
+
+      const issueSvc = issueService(db);
+
+      // 8. File alerts for root blockers
+      for (const rb of rootBlockers) {
+        const originId = `blocker:${rb.id}`;
+        if (alreadyAlerted.has(originId)) {
+          skipped += 1;
+          continue;
+        }
+
+        // Escalate priority to critical if it's not already
+        if (rb.priority !== "critical") {
+          await db
+            .update(issues)
+            .set({ priority: "critical", updatedAt: new Date() })
+            .where(eq(issues.id, rb.id));
+          logger.info(
+            { issueId: rb.id, identifier: rb.identifier, oldPriority: rb.priority },
+            "blocking-chain sweep: escalated root blocker to critical priority",
+          );
+        }
+
+        // Collect the blocked issue identifiers for the description
+        const blockedIds = blockerToBlocked.get(rb.id) ?? [];
+        const directBlocked = blockedIds
+          .map((bid) => issueMap.get(bid))
+          .filter(Boolean)
+          .map((m) => `\`${m!.identifier}\` (${m!.status})`)
+          .join(", ");
+
+        const title = `Unblock ${rb.identifier}: root blocker for ${rb.fanOut} issue${rb.fanOut > 1 ? "s" : ""}`;
+        const description = [
+          `**${rb.identifier}** ("${rb.title}") is blocking **${rb.fanOut} downstream issue${rb.fanOut > 1 ? "s" : ""}** (transitively).`,
+          ``,
+          `**Current status**: ${rb.status}`,
+          `**Current priority**: ${rb.priority} → escalated to **critical**`,
+          `**Assigned to**: ${rb.assigneeAgentId ? `agent \`${rb.assigneeAgentId}\`` : "unassigned"}`,
+          `**Directly blocks**: ${directBlocked || "none"}`,
+          ``,
+          `**Action**: Prioritize unblocking this issue. Options:`,
+          `- If the assignee is stuck, reassign or break the issue into smaller pieces`,
+          `- If the blocker is in_review, expedite the review`,
+          `- If the issue is no longer relevant, cancel it to unblock dependents`,
+          ``,
+          `_Auto-filed by the blocking-chain sweep. Dedup: originKind=watchdog, originId=${originId}._`,
+        ].join("\n");
+
+        try {
+          const created = await issueSvc.create(companyId, {
+            title,
+            description,
+            priority: "high",
+            status: "todo",
+            assigneeAgentId: cooId,
+            originKind: "watchdog",
+            originId,
+          });
+          escalated += 1;
+          logger.warn(
+            {
+              rootBlockerId: rb.id,
+              rootBlockerIdentifier: rb.identifier,
+              fanOut: rb.fanOut,
+              watchdogIssueId: created.id,
+              cooId,
+            },
+            "blocking-chain sweep: filed COO alert for root blocker",
+          );
+          await enqueueWakeup(cooId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "issue_assigned",
+            payload: { issueId: created.id, mutation: "create" },
+            requestedByActorType: "system",
+            requestedByActorId: "blocking_chain_sweep",
+            contextSnapshot: { issueId: created.id, source: "blocking_chain_sweep" },
+          }).catch((err) => {
+            logger.warn(
+              { err, watchdogIssueId: created.id, cooId },
+              "blocking-chain sweep: failed to wake COO after filing alert",
+            );
+          });
+        } catch (err) {
+          logger.warn(
+            { err, rootBlockerId: rb.id },
+            "blocking-chain sweep: failed to file COO alert",
+          );
+        }
+      }
+
+      // 9. File a single alert for circular blocking if detected
+      if (inCycle.size > 0) {
+        const cycleOriginId = `cycle:${companyId}`;
+        if (!alreadyAlerted.has(cycleOriginId)) {
+          const cycleIssues = [...inCycle]
+            .map((id) => issueMap.get(id))
+            .filter(Boolean)
+            .map((m) => `- \`${m!.identifier}\` ("${m!.title}") — ${m!.status}`)
+            .join("\n");
+
+          const title = `Circular blocking detected: ${inCycle.size} issue${inCycle.size > 1 ? "s" : ""} in dependency cycle`;
+          const description = [
+            `The following issues form a circular dependency and **none of them can progress**:`,
+            ``,
+            cycleIssues,
+            ``,
+            `**Action**: Break the cycle by removing at least one blocking relation, cancelling an issue, or manually marking one as done.`,
+            ``,
+            `_Auto-filed by the blocking-chain sweep. Dedup: originKind=watchdog, originId=${cycleOriginId}._`,
+          ].join("\n");
+
+          try {
+            const created = await issueSvc.create(companyId, {
+              title,
+              description,
+              priority: "critical",
+              status: "todo",
+              assigneeAgentId: cooId,
+              originKind: "watchdog",
+              originId: cycleOriginId,
+            });
+            cyclesDetected += 1;
+            logger.warn(
+              {
+                cycleSize: inCycle.size,
+                cycleIssueIds: [...inCycle],
+                watchdogIssueId: created.id,
+                cooId,
+              },
+              "blocking-chain sweep: filed COO alert for circular dependency",
+            );
+            await enqueueWakeup(cooId, {
+              source: "assignment",
+              triggerDetail: "system",
+              reason: "issue_assigned",
+              payload: { issueId: created.id, mutation: "create" },
+              requestedByActorType: "system",
+              requestedByActorId: "blocking_chain_sweep",
+              contextSnapshot: { issueId: created.id, source: "blocking_chain_sweep" },
+            }).catch((err) => {
+              logger.warn(
+                { err, cycleOriginId },
+                "blocking-chain sweep: failed to wake COO after cycle alert",
+              );
+            });
+          } catch (err) {
+            logger.warn(
+              { err, cycleSize: inCycle.size },
+              "blocking-chain sweep: failed to file cycle alert",
+            );
+          }
+        } else {
+          skipped += 1;
+        }
+      }
+    }
+
+    if (escalated > 0 || cyclesDetected > 0) {
+      logger.warn(
+        { escalated, cyclesDetected, skipped },
+        "blocking-chain sweep: completed with actions",
+      );
+    }
+    return { escalated, cyclesDetected, skipped };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Stale in_review nudge sweep
+  //
+  // in_review issues that sit unattended become invisible bottlenecks.
+  // - ≥ 4h: re-wake the assigned agent with a review_stale nudge
+  // - ≥ 12h: file a COO alert to reassign or force-approve
+  // ---------------------------------------------------------------------------
+  const REVIEW_NUDGE_THRESHOLD_MS = 4 * 60 * 60 * 1000;
+  const REVIEW_ESCALATE_THRESHOLD_MS = 12 * 60 * 60 * 1000;
+
+  async function sweepStaleReviews() {
+    const nudgeCutoff = new Date(Date.now() - REVIEW_NUDGE_THRESHOLD_MS);
+    const escalateCutoff = new Date(Date.now() - REVIEW_ESCALATE_THRESHOLD_MS);
+
+    const stale = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        title: issues.title,
+        companyId: issues.companyId,
+        assigneeAgentId: issues.assigneeAgentId,
+        updatedAt: issues.updatedAt,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "in_review"),
+          lt(issues.updatedAt, nudgeCutoff),
+        ),
+      );
+
+    if (stale.length === 0) return { nudged: 0, escalated: 0, skipped: 0 };
+
+    let nudged = 0;
+    let escalatedCount = 0;
+    let skipped = 0;
+
+    // Batch-check existing alerts
+    const escalateCandidateIds = stale
+      .filter((i) => i.updatedAt && new Date(i.updatedAt).getTime() < escalateCutoff.getTime())
+      .map((i) => `stale_review:${i.id}`);
+
+    const existingAlerts = escalateCandidateIds.length > 0
+      ? await db
+          .select({ originId: issues.originId })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.originKind, "watchdog"),
+              inArray(issues.originId, escalateCandidateIds),
+              sql`${issues.status} NOT IN ('done', 'cancelled')`,
+            ),
+          )
+      : [];
+    const alreadyAlerted = new Set(existingAlerts.map((e) => e.originId));
+
+    // Cache COO lookups per company
+    const cooByCompany = new Map<string, string | null>();
+    async function findCoo(companyId: string) {
+      if (cooByCompany.has(companyId)) return cooByCompany.get(companyId)!;
+      const row = await db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(
+          and(
+            eq(agents.companyId, companyId),
+            eq(agents.role, "coo"),
+            sql`${agents.status} NOT IN ('terminated', 'paused', 'pending_approval')`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0]?.id ?? null);
+      cooByCompany.set(companyId, row);
+      return row;
+    }
+
+    const issueSvc = issueService(db);
+
+    for (const issue of stale) {
+      const ageMs = Date.now() - new Date(issue.updatedAt!).getTime();
+      const ageHours = Math.round(ageMs / (60 * 60 * 1000) * 10) / 10;
+      const needsEscalation = ageMs >= REVIEW_ESCALATE_THRESHOLD_MS;
+
+      // Nudge: re-wake the assigned agent if idle and no execution lock
+      if (issue.assigneeAgentId && !issue.executionRunId) {
+        await enqueueWakeup(issue.assigneeAgentId, {
+          source: "on_demand",
+          triggerDetail: "system",
+          reason: "review_stale",
+          requestedByActorType: "system",
+          requestedByActorId: "stale_review_sweep",
+          contextSnapshot: {
+            issueId: issue.id,
+            source: "stale_review_sweep",
+            ageHours,
+          },
+        }).catch((err) => {
+          logger.warn({ err, issueId: issue.id }, "stale-review sweep: failed to nudge agent");
+        });
+        nudged += 1;
+      }
+
+      // Escalate to COO if >12h
+      if (needsEscalation) {
+        const originId = `stale_review:${issue.id}`;
+        if (alreadyAlerted.has(originId)) {
+          skipped += 1;
+          continue;
+        }
+        const cooId = await findCoo(issue.companyId);
+        if (!cooId) {
+          skipped += 1;
+          continue;
+        }
+
+        const title = `Stale review: ${issue.identifier ?? issue.id} in_review for ${ageHours}h`;
+        const description = [
+          `**${issue.identifier}** ("${issue.title}") has been \`in_review\` for **${ageHours} hours**.`,
+          ``,
+          `**Assigned to**: ${issue.assigneeAgentId ? `agent \`${issue.assigneeAgentId}\`` : "unassigned"}`,
+          ``,
+          `**Action**: Review and either:`,
+          `- Approve and move to \`done\``,
+          `- Send back to \`in_progress\` with feedback`,
+          `- Reassign the review to another agent`,
+          ``,
+          `_Auto-filed by the stale-review sweep. Dedup: originKind=watchdog, originId=${originId}._`,
+        ].join("\n");
+
+        try {
+          const created = await issueSvc.create(issue.companyId, {
+            title,
+            description,
+            priority: "high",
+            status: "todo",
+            assigneeAgentId: cooId,
+            originKind: "watchdog",
+            originId,
+          });
+          escalatedCount += 1;
+          logger.warn(
+            {
+              staleIssueId: issue.id,
+              staleIdentifier: issue.identifier,
+              ageHours,
+              watchdogIssueId: created.id,
+              cooId,
+            },
+            "stale-review sweep: filed COO alert for stale in_review issue",
+          );
+          await enqueueWakeup(cooId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "issue_assigned",
+            payload: { issueId: created.id, mutation: "create" },
+            requestedByActorType: "system",
+            requestedByActorId: "stale_review_sweep",
+            contextSnapshot: { issueId: created.id, source: "stale_review_sweep" },
+          }).catch((err) => {
+            logger.warn(
+              { err, watchdogIssueId: created.id, cooId },
+              "stale-review sweep: failed to wake COO after filing alert",
+            );
+          });
+        } catch (err) {
+          logger.warn(
+            { err, issueId: issue.id },
+            "stale-review sweep: failed to file COO alert",
+          );
+        }
+      }
+    }
+
+    if (nudged > 0 || escalatedCount > 0) {
+      logger.info(
+        { nudged, escalated: escalatedCount, skipped, total: stale.length },
+        "stale-review sweep: completed",
+      );
+    }
+    return { nudged, escalated: escalatedCount, skipped };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Stranded wakeup request reaper + deferred execution promoter
+  //
+  // Handles two cases:
+  // 1. deferred_issue_execution requests where the issue lock has since cleared
+  //    (run finished or lock was cleaned up) — promotes them to a real wakeup.
+  // 2. queued wakeup requests older than 1h with no heartbeat run — cancels them
+  //    as stale.
+  // ---------------------------------------------------------------------------
+  const DEFERRED_STALENESS_MS = 5 * 60 * 1000;
+  const QUEUED_REQUEST_STALENESS_MS = 60 * 60 * 1000;
+
+  async function reapStrandedWakeupRequests() {
+    const now = new Date();
+    let promoted = 0;
+    let cancelledDeferred = 0;
+    let cancelledQueued = 0;
+
+    // --- Part 1: Stale deferred_issue_execution requests ---
+    const deferredCutoff = new Date(now.getTime() - DEFERRED_STALENESS_MS);
+    const staleDeferreds = await db
+      .select({
+        id: agentWakeupRequests.id,
+        agentId: agentWakeupRequests.agentId,
+        companyId: agentWakeupRequests.companyId,
+        payload: agentWakeupRequests.payload,
+        source: agentWakeupRequests.source,
+        createdAt: agentWakeupRequests.createdAt,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          lt(agentWakeupRequests.createdAt, deferredCutoff),
+        ),
+      )
+      .orderBy(asc(agentWakeupRequests.createdAt));
+
+    for (const deferred of staleDeferreds) {
+      const payload = deferred.payload as Record<string, unknown> | null;
+      const issueId = typeof payload?.issueId === "string" ? payload.issueId : null;
+      if (!issueId) {
+        // No issue ID — cancel as invalid
+        await db
+          .update(agentWakeupRequests)
+          .set({ status: "cancelled", finishedAt: now, error: "No issueId in payload", updatedAt: now })
+          .where(eq(agentWakeupRequests.id, deferred.id));
+        cancelledDeferred += 1;
+        continue;
+      }
+
+      const issue = await db
+        .select({ id: issues.id, status: issues.status, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+
+      if (!issue || ["done", "cancelled"].includes(issue.status)) {
+        // Issue is terminal or deleted — cancel the deferral
+        await db
+          .update(agentWakeupRequests)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: issue ? `Issue is ${issue.status}` : "Issue not found",
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, deferred.id));
+        cancelledDeferred += 1;
+        continue;
+      }
+
+      // Check if the issue execution lock is clear
+      if (issue.executionRunId) {
+        const lockRun = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, issue.executionRunId))
+          .then((rows) => rows[0] ?? null);
+        const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+        if (lockRun && !terminalStatuses.has(lockRun.status)) continue; // Still locked by a live run
+      }
+
+      // Issue is unlocked — promote by re-issuing a wakeup
+      try {
+        await enqueueWakeup(deferred.agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "deferred_execution_promoted",
+          payload: { issueId },
+          requestedByActorType: "system",
+          requestedByActorId: "stranded_wakeup_reaper",
+          contextSnapshot: { issueId, source: "stranded_wakeup_reaper" },
+        });
+        // Mark the old deferral as completed
+        await db
+          .update(agentWakeupRequests)
+          .set({
+            status: "completed",
+            finishedAt: now,
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, deferred.id));
+        promoted += 1;
+        logger.info(
+          { deferredId: deferred.id, agentId: deferred.agentId, issueId },
+          "stranded-wakeup reaper: promoted stale deferred execution",
+        );
+      } catch (err) {
+        logger.warn(
+          { err, deferredId: deferred.id, issueId },
+          "stranded-wakeup reaper: failed to promote deferred execution",
+        );
+      }
+    }
+
+    // --- Part 2: Stale queued wakeup requests with no run ---
+    const queuedCutoff = new Date(now.getTime() - QUEUED_REQUEST_STALENESS_MS);
+    const staleQueued = await db
+      .select({
+        id: agentWakeupRequests.id,
+        runId: agentWakeupRequests.runId,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.status, "queued"),
+          isNull(agentWakeupRequests.claimedAt),
+          lt(agentWakeupRequests.createdAt, queuedCutoff),
+        ),
+      );
+
+    for (const req of staleQueued) {
+      // If it has a run ID, check if the run is still live
+      if (req.runId) {
+        const run = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, req.runId))
+          .then((rows) => rows[0] ?? null);
+        const terminalRunStatuses = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+        if (run && !terminalRunStatuses.has(run.status)) {
+          continue; // Run is still live — leave the request
+        }
+      }
+
+      await db
+        .update(agentWakeupRequests)
+        .set({
+          status: "cancelled",
+          finishedAt: now,
+          error: "Cancelled: stale queued request (never claimed)",
+          updatedAt: now,
+        })
+        .where(eq(agentWakeupRequests.id, req.id));
+      cancelledQueued += 1;
+    }
+
+    if (promoted > 0 || cancelledDeferred > 0 || cancelledQueued > 0) {
+      logger.info(
+        { promoted, cancelledDeferred, cancelledQueued },
+        "stranded-wakeup reaper: completed",
+      );
+    }
+    return { promoted, cancelledDeferred, cancelledQueued };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Deduplicate routine-spawned issues
+  //
+  // For each routine with multiple open issues (originKind='routine_execution'),
+  // keep the most recently updated one and cancel the rest. Runs on every tick
+  // but is effectively a no-op once duplicates are cleared.
+  // ---------------------------------------------------------------------------
+  async function deduplicateRoutineIssues() {
+    // Find routines with more than one open issue
+    const dupes = await db
+      .select({
+        originId: issues.originId,
+        count: sql<number>`count(*)`.as("count"),
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.originKind, "routine_execution"),
+          sql`${issues.originId} IS NOT NULL`,
+          inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+        ),
+      )
+      .groupBy(issues.originId)
+      .having(sql`count(*) > 1`);
+
+    if (dupes.length === 0) return { cancelled: 0 };
+
+    let cancelled = 0;
+
+    for (const { originId } of dupes) {
+      if (!originId) continue;
+
+      // Get all open issues for this routine, newest first
+      const openIssues = await db
+        .select({ id: issues.id, identifier: issues.identifier, updatedAt: issues.updatedAt })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.originKind, "routine_execution"),
+            eq(issues.originId, originId),
+            inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+          ),
+        )
+        .orderBy(desc(issues.updatedAt))
+        .limit(100);
+
+      if (openIssues.length <= 1) continue;
+
+      // Keep the first (newest), cancel the rest
+      const toCancel = openIssues.slice(1).map((i) => i.id);
+      const cancelledIdentifiers = openIssues.slice(1).map((i) => i.identifier);
+
+      await db
+        .update(issues)
+        .set({
+          status: "cancelled",
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(inArray(issues.id, toCancel));
+
+      cancelled += toCancel.length;
+      logger.info(
+        { routineId: originId, kept: openIssues[0].identifier, cancelled: cancelledIdentifiers },
+        "deduplicateRoutineIssues: cancelled duplicate routine issues",
+      );
+    }
+
+    return { cancelled };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Ghost agent cleanup
+  //
+  // Terminates agents that never heartbeated and aren't in pending_approval.
+  // These are stale clones or failed provisioning attempts. Runs on every tick
+  // but is a no-op once ghosts are cleaned up.
+  // ---------------------------------------------------------------------------
+  async function cleanupGhostAgents() {
+    const ghosts = await db
+      .update(agents)
+      .set({ status: "terminated", updatedAt: new Date() })
+      .where(
+        and(
+          isNull(agents.lastHeartbeatAt),
+          sql`${agents.status} NOT IN ('terminated', 'pending_approval')`,
+        ),
+      )
+      .returning({ id: agents.id, name: agents.name });
+
+    if (ghosts.length > 0) {
+      logger.info(
+        { terminated: ghosts.length, names: ghosts.map((g) => g.name) },
+        "cleanupGhostAgents: terminated ghost agents that never heartbeated",
+      );
+    }
+    return { terminated: ghosts.length };
+  }
+
+  // ---------------------------------------------------------------------------
+  // COO self-watchdog (#10)
+  //
+  // All other sweeps route alerts to the COO.  If the COO itself goes
+  // unresponsive, alerts pile up silently.  This sweep detects that:
+  //   ≥ 2h with open issues and no recent run  → re-wake COO
+  //   ≥ 6h                                     → escalate to CTO
+  // ---------------------------------------------------------------------------
+  const COO_NUDGE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
+  const COO_ESCALATE_THRESHOLD_MS = 6 * 60 * 60 * 1000;
+
+  async function sweepCOOHealth() {
+    // Find all active COO agents across companies
+    const coos = await db
+      .select({
+        id: agents.id,
+        name: agents.name,
+        companyId: agents.companyId,
+        lastHeartbeatAt: agents.lastHeartbeatAt,
+      })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.role, "coo"),
+          sql`${agents.status} NOT IN ('terminated', 'paused', 'pending_approval')`,
+        ),
+      );
+
+    if (coos.length === 0) return { nudged: 0, escalated: 0, skipped: 0 };
+
+    let nudged = 0;
+    let escalatedCount = 0;
+    let skipped = 0;
+    const issueSvc = issueService(db);
+
+    for (const coo of coos) {
+      // Check if COO has open (non-terminal) issues
+      const openCount = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.assigneeAgentId, coo.id),
+            inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+            isNull(issues.hiddenAt),
+          ),
+        )
+        .then((rows) => rows[0]?.count ?? 0);
+
+      if (openCount === 0) {
+        skipped += 1;
+        continue;
+      }
+
+      // Check most recent completed run
+      const lastRun = await db
+        .select({
+          finishedAt: heartbeatRuns.finishedAt,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, coo.id),
+            inArray(heartbeatRuns.status, ["succeeded", "failed"]),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.finishedAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      // If COO has a running run right now, it's not unresponsive
+      const hasActiveRun = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, coo.id),
+            inArray(heartbeatRuns.status, ["queued", "running"]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0);
+
+      if (hasActiveRun) {
+        skipped += 1;
+        continue;
+      }
+
+      const lastRunTime = lastRun?.finishedAt
+        ? new Date(lastRun.finishedAt).getTime()
+        : coo.lastHeartbeatAt
+          ? new Date(coo.lastHeartbeatAt).getTime()
+          : 0;
+      const idleMs = Date.now() - lastRunTime;
+
+      if (idleMs < COO_NUDGE_THRESHOLD_MS) {
+        skipped += 1;
+        continue;
+      }
+
+      const idleHours = Math.round(idleMs / (60 * 60 * 1000) * 10) / 10;
+
+      // Nudge: re-wake COO
+      await enqueueWakeup(coo.id, {
+        source: "on_demand",
+        triggerDetail: "system",
+        reason: "self_watchdog",
+        requestedByActorType: "system",
+        requestedByActorId: "coo_health_sweep",
+        contextSnapshot: {
+          source: "coo_health_sweep",
+          idleHours,
+          openIssues: openCount,
+        },
+      }).catch((err) => {
+        logger.warn({ err, cooId: coo.id }, "coo-health sweep: failed to nudge COO");
+      });
+      nudged += 1;
+
+      logger.info(
+        { cooId: coo.id, cooName: coo.name, idleHours, openIssues: openCount },
+        "coo-health sweep: nudged idle COO",
+      );
+
+      // Escalate to CTO if ≥6h idle
+      if (idleMs >= COO_ESCALATE_THRESHOLD_MS) {
+        const originId = `coo_health:${coo.id}`;
+
+        // Dedup check
+        const existing = await db
+          .select({ id: issues.id })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.originKind, "watchdog"),
+              eq(issues.originId, originId),
+              sql`${issues.status} NOT IN ('done', 'cancelled')`,
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+
+        if (existing) {
+          skipped += 1;
+          continue;
+        }
+
+        // Find CTO in this company
+        const ctoRow = await db
+          .select({ id: agents.id })
+          .from(agents)
+          .where(
+            and(
+              eq(agents.companyId, coo.companyId),
+              eq(agents.role, "cto"),
+              sql`${agents.status} NOT IN ('terminated', 'paused', 'pending_approval')`,
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+
+        if (!ctoRow) {
+          skipped += 1;
+          continue;
+        }
+
+        const title = `COO unresponsive: ${coo.name} idle for ${idleHours}h with ${openCount} open issues`;
+        const description = [
+          `The COO agent **${coo.name}** (\`${coo.id}\`) has not completed a run in **${idleHours} hours** and has **${openCount} open issues** assigned to it.`,
+          ``,
+          `All watchdog alerts (stuck runs, blocking chains, stale reviews, queue depth) route to the COO. When the COO is unresponsive, the entire alert pipeline is dead.`,
+          ``,
+          `**Last run finished**: ${lastRun?.finishedAt ? new Date(lastRun.finishedAt).toISOString() : "unknown"}`,
+          ``,
+          `**Action**: Investigate why the COO is not running. Options:`,
+          `- Check if the COO agent has an error state (adapter failure, sandbox issue)`,
+          `- Manually wake the COO via the API`,
+          `- If the COO agent is unrecoverable, provision a replacement`,
+          ``,
+          `_Auto-filed by the COO health sweep. Dedup: originKind=watchdog, originId=${originId}._`,
+        ].join("\n");
+
+        try {
+          const created = await issueSvc.create(coo.companyId, {
+            title,
+            description,
+            priority: "critical",
+            status: "todo",
+            assigneeAgentId: ctoRow.id,
+            originKind: "watchdog",
+            originId,
+          });
+          escalatedCount += 1;
+          logger.warn(
+            {
+              cooId: coo.id,
+              cooName: coo.name,
+              idleHours,
+              watchdogIssueId: created.id,
+              ctoId: ctoRow.id,
+            },
+            "coo-health sweep: escalated unresponsive COO to CTO",
+          );
+          await enqueueWakeup(ctoRow.id, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "issue_assigned",
+            payload: { issueId: created.id, mutation: "create" },
+            requestedByActorType: "system",
+            requestedByActorId: "coo_health_sweep",
+            contextSnapshot: { issueId: created.id, source: "coo_health_sweep" },
+          }).catch((err) => {
+            logger.warn(
+              { err, watchdogIssueId: created.id, ctoId: ctoRow.id },
+              "coo-health sweep: failed to wake CTO after filing alert",
+            );
+          });
+        } catch (err) {
+          logger.warn(
+            { err, cooId: coo.id },
+            "coo-health sweep: failed to file CTO alert",
+          );
+        }
+      }
+    }
+
+    if (nudged > 0 || escalatedCount > 0) {
+      logger.info(
+        { nudged, escalated: escalatedCount, skipped, cooCount: coos.length },
+        "coo-health sweep: completed",
+      );
+    }
+    return { nudged, escalated: escalatedCount, skipped };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Agent queue depth sweep (#11)
+  //
+  // Detects agents with deep wakeup queues (>3 queued requests), which signals
+  // serialization bottlenecks. Files COO alert so work can be redistributed.
+  // ---------------------------------------------------------------------------
+  const QUEUE_DEPTH_ALERT_THRESHOLD = 3;
+
+  async function sweepAgentQueueDepth() {
+    // Count queued wakeup requests per agent
+    const queueDepths = await db
+      .select({
+        agentId: agentWakeupRequests.agentId,
+        depth: sql<number>`count(*)::int`,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.status, "queued"))
+      .groupBy(agentWakeupRequests.agentId);
+
+    const deep = queueDepths.filter((q) => q.depth > QUEUE_DEPTH_ALERT_THRESHOLD);
+    if (deep.length === 0) return { alerted: 0, skipped: 0 };
+
+    // Lookup agent names for logging and alert text
+    const agentIds = deep.map((d) => d.agentId);
+    const agentRows = await db
+      .select({ id: agents.id, name: agents.name, companyId: agents.companyId })
+      .from(agents)
+      .where(inArray(agents.id, agentIds));
+    const agentMap = new Map(agentRows.map((a) => [a.id, a]));
+
+    let alerted = 0;
+    let skipped = 0;
+    const issueSvc = issueService(db);
+
+    // Cache COO lookups per company
+    const cooByCompany = new Map<string, string | null>();
+    async function findCoo(companyId: string) {
+      if (cooByCompany.has(companyId)) return cooByCompany.get(companyId)!;
+      const row = await db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(
+          and(
+            eq(agents.companyId, companyId),
+            eq(agents.role, "coo"),
+            sql`${agents.status} NOT IN ('terminated', 'paused', 'pending_approval')`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0]?.id ?? null);
+      cooByCompany.set(companyId, row);
+      return row;
+    }
+
+    // Batch dedup check
+    const originIds = deep.map((d) => `queue_depth:${d.agentId}`);
+    const existingAlerts = await db
+      .select({ originId: issues.originId })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.originKind, "watchdog"),
+          inArray(issues.originId, originIds),
+          sql`${issues.status} NOT IN ('done', 'cancelled')`,
+        ),
+      );
+    const alreadyAlerted = new Set(existingAlerts.map((e) => e.originId));
+
+    for (const q of deep) {
+      const agent = agentMap.get(q.agentId);
+      if (!agent) {
+        skipped += 1;
+        continue;
+      }
+
+      const originId = `queue_depth:${q.agentId}`;
+      if (alreadyAlerted.has(originId)) {
+        skipped += 1;
+        continue;
+      }
+
+      // Don't alert the COO about itself
+      const cooId = await findCoo(agent.companyId);
+      if (!cooId) {
+        skipped += 1;
+        continue;
+      }
+      if (cooId === q.agentId) {
+        skipped += 1;
+        continue;
+      }
+
+      const title = `Queue bottleneck: ${agent.name} has ${q.depth} queued wakeups`;
+      const description = [
+        `Agent **${agent.name}** (\`${q.agentId}\`) has **${q.depth} queued wakeup requests**, exceeding the threshold of ${QUEUE_DEPTH_ALERT_THRESHOLD}.`,
+        ``,
+        `This indicates a serialization bottleneck — work is piling up faster than the agent can process it.`,
+        ``,
+        `**Action**: Consider redistributing work. Options:`,
+        `- Reassign some of the agent's issues to a less loaded agent`,
+        `- If the agent has a parallel-capable peer (e.g. Alpha/Bravo), route independent tasks to the peer`,
+        `- Check if the agent is stuck on a blocking issue that could be fast-tracked`,
+        `- Cancel stale or duplicate queued wakeups if any are redundant`,
+        ``,
+        `_Auto-filed by the queue-depth sweep. Dedup: originKind=watchdog, originId=${originId}._`,
+      ].join("\n");
+
+      try {
+        const created = await issueSvc.create(agent.companyId, {
+          title,
+          description,
+          priority: "high",
+          status: "todo",
+          assigneeAgentId: cooId,
+          originKind: "watchdog",
+          originId,
+        });
+        alerted += 1;
+        logger.warn(
+          {
+            agentId: q.agentId,
+            agentName: agent.name,
+            queueDepth: q.depth,
+            watchdogIssueId: created.id,
+            cooId,
+          },
+          "queue-depth sweep: filed COO alert for deep queue",
+        );
+        await enqueueWakeup(cooId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId: created.id, mutation: "create" },
+          requestedByActorType: "system",
+          requestedByActorId: "queue_depth_sweep",
+          contextSnapshot: { issueId: created.id, source: "queue_depth_sweep" },
+        }).catch((err) => {
+          logger.warn(
+            { err, watchdogIssueId: created.id, cooId },
+            "queue-depth sweep: failed to wake COO after filing alert",
+          );
+        });
+      } catch (err) {
+        logger.warn(
+          { err, agentId: q.agentId },
+          "queue-depth sweep: failed to file COO alert",
+        );
+      }
+    }
+
+    if (alerted > 0) {
+      logger.warn(
+        { alerted, skipped, deepAgents: deep.length },
+        "queue-depth sweep: completed with alerts",
+      );
+    }
+    return { alerted, skipped };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Wasted run detector (#12)
+  //
+  // Samples the last N completed runs per agent. If ≥ threshold are "no-ops"
+  // (low output tokens AND no issue status change during the run), files a COO
+  // alert so the root cause (bad instructions, missing context, blocked deps)
+  // can be investigated.
+  // ---------------------------------------------------------------------------
+  const WASTED_RUN_SAMPLE_SIZE = 10;
+  const WASTED_RUN_ALERT_THRESHOLD = 8; // 8 out of 10
+  const WASTED_RUN_MAX_OUTPUT_TOKENS = 150;
+
+  async function sweepWastedRunPatterns() {
+    // Get all active (non-terminated, non-paused) agents
+    const activeAgents = await db
+      .select({ id: agents.id, name: agents.name, companyId: agents.companyId })
+      .from(agents)
+      .where(
+        sql`${agents.status} NOT IN ('terminated', 'paused', 'pending_approval')`,
+      );
+
+    if (activeAgents.length === 0) return { alerted: 0, skipped: 0 };
+
+    let alerted = 0;
+    let skipped = 0;
+    const issueSvc = issueService(db);
+
+    // Cache COO lookups
+    const cooByCompany = new Map<string, string | null>();
+    async function findCoo(companyId: string) {
+      if (cooByCompany.has(companyId)) return cooByCompany.get(companyId)!;
+      const row = await db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(
+          and(
+            eq(agents.companyId, companyId),
+            eq(agents.role, "coo"),
+            sql`${agents.status} NOT IN ('terminated', 'paused', 'pending_approval')`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0]?.id ?? null);
+      cooByCompany.set(companyId, row);
+      return row;
+    }
+
+    // Batch dedup check
+    const originIds = activeAgents.map((a) => `wasted_runs:${a.id}`);
+    const existingAlerts = await db
+      .select({ originId: issues.originId })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.originKind, "watchdog"),
+          inArray(issues.originId, originIds),
+          sql`${issues.status} NOT IN ('done', 'cancelled')`,
+        ),
+      );
+    const alreadyAlerted = new Set(existingAlerts.map((e) => e.originId));
+
+    for (const agent of activeAgents) {
+      const originId = `wasted_runs:${agent.id}`;
+      if (alreadyAlerted.has(originId)) {
+        skipped += 1;
+        continue;
+      }
+
+      // Sample the last N completed runs
+      const recentRuns = await db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          startedAt: heartbeatRuns.startedAt,
+          finishedAt: heartbeatRuns.finishedAt,
+          usageJson: heartbeatRuns.usageJson,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agent.id),
+            inArray(heartbeatRuns.status, ["succeeded", "failed"]),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.finishedAt))
+        .limit(WASTED_RUN_SAMPLE_SIZE);
+
+      // Need at least a full sample to judge
+      if (recentRuns.length < WASTED_RUN_SAMPLE_SIZE) {
+        skipped += 1;
+        continue;
+      }
+
+      // Count no-op runs: low output tokens
+      let wastedCount = 0;
+      let wastedTokens = 0;
+      const wastedRunIds: string[] = [];
+
+      for (const run of recentRuns) {
+        const usage = run.usageJson as Record<string, unknown> | null;
+        const rawOut = typeof usage?.rawOutputTokens === "number" ? usage.rawOutputTokens : Infinity;
+
+        if (rawOut < WASTED_RUN_MAX_OUTPUT_TOKENS) {
+          wastedCount += 1;
+          wastedRunIds.push(run.id.slice(0, 8));
+          const inputTok = typeof usage?.inputTokens === "number" ? usage.inputTokens : 0;
+          wastedTokens += inputTok + rawOut;
+        }
+      }
+
+      if (wastedCount < WASTED_RUN_ALERT_THRESHOLD) {
+        skipped += 1;
+        continue;
+      }
+
+      // Don't alert COO about itself churning — COO health sweep handles that
+      const cooId = await findCoo(agent.companyId);
+      if (!cooId) {
+        skipped += 1;
+        continue;
+      }
+      if (cooId === agent.id) {
+        skipped += 1;
+        continue;
+      }
+
+      // Approximate cost of wasted tokens (rough: $3/M input, $15/M output)
+      const approxWastedCostUsd = (wastedTokens / 1_000_000) * 5; // blended estimate
+      const costStr = approxWastedCostUsd < 0.01 ? "<$0.01" : `~$${approxWastedCostUsd.toFixed(2)}`;
+
+      const title = `Churning: ${agent.name} — ${wastedCount}/${WASTED_RUN_SAMPLE_SIZE} recent runs were no-ops`;
+      const description = [
+        `Agent **${agent.name}** (\`${agent.id}\`) had **${wastedCount} out of ${WASTED_RUN_SAMPLE_SIZE}** recent completed runs produce very little output (<${WASTED_RUN_MAX_OUTPUT_TOKENS} tokens).`,
+        ``,
+        `This suggests the agent is waking up repeatedly without making meaningful progress — burning tokens on context loading for minimal work.`,
+        ``,
+        `**Approximate wasted tokens**: ${wastedTokens.toLocaleString()} (${costStr} estimated)`,
+        `**Sample run IDs**: ${wastedRunIds.join(", ")}`,
+        ``,
+        `**Action**: Investigate root cause. Common patterns:`,
+        `- Agent has no actionable work but keeps getting timer-woken (check heartbeat interval)`,
+        `- Agent is stuck on a blocking dependency and keeps re-reading context without progress`,
+        `- Agent instructions are too vague, causing exploratory no-op runs`,
+        `- Agent's assigned issues are all blocked or in_review with nothing to do`,
+        ``,
+        `_Auto-filed by the wasted-run sweep. Dedup: originKind=watchdog, originId=${originId}._`,
+      ].join("\n");
+
+      try {
+        const created = await issueSvc.create(agent.companyId, {
+          title,
+          description,
+          priority: "medium",
+          status: "todo",
+          assigneeAgentId: cooId,
+          originKind: "watchdog",
+          originId,
+        });
+        alerted += 1;
+        logger.warn(
+          {
+            agentId: agent.id,
+            agentName: agent.name,
+            wastedCount,
+            wastedTokens,
+            watchdogIssueId: created.id,
+            cooId,
+          },
+          "wasted-run sweep: filed COO alert for churning agent",
+        );
+        await enqueueWakeup(cooId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId: created.id, mutation: "create" },
+          requestedByActorType: "system",
+          requestedByActorId: "wasted_run_sweep",
+          contextSnapshot: { issueId: created.id, source: "wasted_run_sweep" },
+        }).catch((err) => {
+          logger.warn(
+            { err, watchdogIssueId: created.id, cooId },
+            "wasted-run sweep: failed to wake COO after filing alert",
+          );
+        });
+      } catch (err) {
+        logger.warn(
+          { err, agentId: agent.id },
+          "wasted-run sweep: failed to file COO alert",
+        );
+      }
+    }
+
+    if (alerted > 0) {
+      logger.warn(
+        { alerted, skipped, agentCount: activeAgents.length },
+        "wasted-run sweep: completed with alerts",
+      );
+    }
+    return { alerted, skipped };
   }
 
   async function resumeQueuedRuns() {
@@ -2381,7 +4039,15 @@ export function heartbeatService(db: Db) {
     if (paperclipWakePayload) {
       context[PAPERCLIP_WAKE_PAYLOAD_KEY] = paperclipWakePayload;
     } else {
-      delete context[PAPERCLIP_WAKE_PAYLOAD_KEY];
+      // Plugin session messages (e.g. Signal) carry the user's message in
+      // context.prompt.  Surface it as a minimal wake payload so that
+      // renderPaperclipWakePrompt can pass it through to the adapter prompt.
+      const directPrompt = readNonEmptyString(context.prompt);
+      if (directPrompt) {
+        context[PAPERCLIP_WAKE_PAYLOAD_KEY] = { prompt: directPrompt };
+      } else {
+        delete context[PAPERCLIP_WAKE_PAYLOAD_KEY];
+      }
     }
     const existingExecutionWorkspace =
       issueRef?.executionWorkspaceId ? await executionWorkspacesSvc.getById(issueRef.executionWorkspaceId) : null;
@@ -4178,6 +5844,26 @@ export function heartbeatService(db: Db) {
 
     reapOrphanedRuns,
 
+    clearTerminalIssueLocks,
+
+    sweepStuckRuns,
+
+    sweepBlockingChains,
+
+    sweepStaleReviews,
+
+    reapStrandedWakeupRequests,
+
+    deduplicateRoutineIssues,
+
+    cleanupGhostAgents,
+
+    sweepCOOHealth,
+
+    sweepAgentQueueDepth,
+
+    sweepWastedRunPatterns,
+
     resumeQueuedRuns,
 
     tickTimers: async (now = new Date()) => {
@@ -4185,6 +5871,7 @@ export function heartbeatService(db: Db) {
       let checked = 0;
       let enqueued = 0;
       let skipped = 0;
+      let throttled = 0;
 
       for (const agent of allAgents) {
         if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;
@@ -4195,6 +5882,52 @@ export function heartbeatService(db: Db) {
         const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
+
+        // Circuit breaker: if the last 3 succeeded runs were all no-ops
+        // (< 10s duration, < 100 raw output tokens), back off the timer
+        // to avoid tight-loop polling that burns tokens for no work.
+        const IDLE_RUN_LOOKBACK = 3;
+        const IDLE_MAX_DURATION_SEC = 10;
+        const IDLE_MAX_OUTPUT_TOKENS = 100;
+        const IDLE_BACKOFF_MULTIPLIER = 4;
+        const MAX_BACKOFF_MULTIPLIER = 10;
+
+        const recentRuns = await db
+          .select({
+            status: heartbeatRuns.status,
+            startedAt: heartbeatRuns.startedAt,
+            finishedAt: heartbeatRuns.finishedAt,
+            usageJson: heartbeatRuns.usageJson,
+          })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.agentId, agent.id),
+              eq(heartbeatRuns.status, "succeeded"),
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.finishedAt))
+          .limit(IDLE_RUN_LOOKBACK);
+
+        if (recentRuns.length === IDLE_RUN_LOOKBACK) {
+          const allIdle = recentRuns.every((r) => {
+            if (!r.startedAt || !r.finishedAt) return false;
+            const durSec =
+              (new Date(r.finishedAt).getTime() - new Date(r.startedAt).getTime()) / 1000;
+            const usage = r.usageJson as Record<string, unknown> | null;
+            const rawOut = typeof usage?.rawOutputTokens === "number" ? usage.rawOutputTokens : Infinity;
+            return durSec < IDLE_MAX_DURATION_SEC && rawOut < IDLE_MAX_OUTPUT_TOKENS;
+          });
+
+          if (allIdle) {
+            const effectiveIntervalMs =
+              policy.intervalSec * 1000 * Math.min(IDLE_BACKOFF_MULTIPLIER, MAX_BACKOFF_MULTIPLIER);
+            if (elapsedMs < effectiveIntervalMs) {
+              throttled += 1;
+              continue;
+            }
+          }
+        }
 
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
@@ -4212,7 +5945,11 @@ export function heartbeatService(db: Db) {
         else skipped += 1;
       }
 
-      return { checked, enqueued, skipped };
+      if (throttled > 0) {
+        logger.info({ throttled }, "tickTimers: circuit-breaker throttled idle agent timer wakeups");
+      }
+
+      return { checked, enqueued, skipped, throttled };
     },
 
     cancelRun: (runId: string) => cancelRunInternal(runId),

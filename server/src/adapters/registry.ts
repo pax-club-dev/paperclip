@@ -1,4 +1,5 @@
 import type { ServerAdapterModule } from "./types.js";
+// Force reload v4: sandbox EROFS fix + two-phase Signal response
 import { getAdapterSessionManagement } from "@paperclipai/adapter-utils";
 import {
   execute as claudeExecute,

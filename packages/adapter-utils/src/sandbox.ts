@@ -14,6 +14,7 @@
 //   6. Private /tmp per sandbox.
 
 import { execFileSync } from "node:child_process";
+import { mkdirSync, existsSync } from "node:fs";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -147,9 +148,11 @@ function buildBwrapArgs(
   result.push("--tmpfs", `${instanceRoot}/db`);
   result.push("--tmpfs", `${instanceRoot}/workspaces`);
   //    .env exposes PAPERCLIP_AGENT_JWT_SECRET — agent could forge JWTs
-  result.push("--tmpfs", `${instanceRoot}/.env`);
+  //    Note: --tmpfs only works on directories; .env is a file, so we mask
+  //    it by bind-mounting /dev/null over it (makes it appear as empty file).
+  result.push("--ro-bind", "/dev/null", `${instanceRoot}/.env`);
   //    config.json exposes DB port, backup paths, internal architecture
-  result.push("--tmpfs", `${instanceRoot}/config.json`);
+  result.push("--ro-bind", "/dev/null", `${instanceRoot}/config.json`);
   //
   //    High: cross-company isolation, database backups
   result.push("--tmpfs", `${instanceRoot}/companies`);
@@ -201,11 +204,20 @@ function buildBwrapArgs(
     }
   }
 
-  // 12. Namespace and lifecycle options
+  // 12. Plugins directory — agents need access to installed plugin assets
+  if (config.homeDir) {
+    const pluginsDir = `${config.homeDir}/.paperclip/plugins`;
+    if (!existsSync(pluginsDir)) {
+      mkdirSync(pluginsDir, { recursive: true });
+    }
+    result.push("--bind", pluginsDir, pluginsDir);
+  }
+
+  // 13. Namespace and lifecycle options
   result.push("--unshare-pid");   // PID namespace: agent can't see/signal other processes
   result.push("--die-with-parent"); // Kill sandbox if parent (server) dies
 
-  // 13. Separator and the actual command
+  // 14. Separator and the actual command
   result.push("--", command, ...args);
 
   return result;

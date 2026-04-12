@@ -300,7 +300,14 @@ export function renderPaperclipWakePrompt(
   options: { resumedSession?: boolean } = {},
 ): string {
   const normalized = normalizePaperclipWakePayload(value);
-  if (!normalized) return "";
+  if (!normalized) {
+    // Plugin session messages use { prompt: "..." } without comments/commentIds.
+    // Pass the prompt through directly so it reaches the agent.
+    const raw = parseObject(value);
+    const directPrompt = asString(raw.prompt, "").trim();
+    if (directPrompt) return directPrompt;
+    return "";
+  }
   const resumedSession = options.resumedSession === true;
 
   const lines = resumedSession
@@ -1058,6 +1065,7 @@ export async function runChildProcess(
         let stdout = "";
         let stderr = "";
         let logChain: Promise<void> = Promise.resolve();
+        let resultGraceTimeout: ReturnType<typeof setTimeout> | null = null;
 
         const timeout =
           opts.timeoutSec > 0
@@ -1072,12 +1080,37 @@ export async function runChildProcess(
               }, opts.timeoutSec * 1000)
             : null;
 
+        // Grace period (seconds) after adapter emits a result line.
+        // If the process hasn't exited by then, kill it — the work is done
+        // and a hung child process is keeping the bwrap wrapper alive.
+        const RESULT_GRACE_SEC = 30;
+
         child.stdout?.on("data", (chunk: unknown) => {
           const text = String(chunk);
           stdout = appendWithCap(stdout, text);
           logChain = logChain
             .then(() => opts.onLog("stdout", text))
             .catch((err) => onLogError(err, runId, "failed to append stdout log chunk"));
+
+          // Detect adapter result line — Claude emits {"type":"result",...}
+          // and Codex emits {"type":"turn.completed",...} as their final output.
+          if (!resultGraceTimeout && (/"type"\s*:\s*"result"/.test(text) || /"type"\s*:\s*"turn\.completed"/.test(text))) {
+            resultGraceTimeout = setTimeout(() => {
+              if (!child.killed) {
+                onLogError(
+                  new Error(`Process still alive ${RESULT_GRACE_SEC}s after result — killing`),
+                  runId,
+                  "result-grace-kill",
+                );
+                child.kill("SIGTERM");
+                setTimeout(() => {
+                  if (!child.killed) {
+                    child.kill("SIGKILL");
+                  }
+                }, 5_000);
+              }
+            }, RESULT_GRACE_SEC * 1000);
+          }
         });
 
         child.stderr?.on("data", (chunk: unknown) => {
@@ -1090,6 +1123,7 @@ export async function runChildProcess(
 
         child.on("error", (err: Error) => {
           if (timeout) clearTimeout(timeout);
+          if (resultGraceTimeout) clearTimeout(resultGraceTimeout);
           runningProcesses.delete(runId);
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
@@ -1102,6 +1136,7 @@ export async function runChildProcess(
 
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
           if (timeout) clearTimeout(timeout);
+          if (resultGraceTimeout) clearTimeout(resultGraceTimeout);
           runningProcesses.delete(runId);
           void logChain.finally(() => {
             resolve({

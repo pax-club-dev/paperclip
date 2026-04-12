@@ -110,9 +110,10 @@ describe("bwrap args structure", () => {
     expect(tmpfsPaths).toContain(`${root}/workspaces`);
     expect(tmpfsPaths).toContain("/tmp");
 
-    // Critical: JWT secret and config
-    expect(tmpfsPaths).toContain(`${root}/.env`);
-    expect(tmpfsPaths).toContain(`${root}/config.json`);
+    // Critical: .env and config.json are FILES, not directories.
+    // They must be masked with --ro-bind /dev/null, not --tmpfs.
+    expect(tmpfsPaths).not.toContain(`${root}/.env`);
+    expect(tmpfsPaths).not.toContain(`${root}/config.json`);
 
     // High: cross-company, database backups
     expect(tmpfsPaths).toContain(`${root}/companies`);
@@ -274,5 +275,87 @@ describe("bwrap args structure", () => {
     if (result.command !== "bwrap") return;
     expect(result.args).toContain("--unshare-pid");
     expect(result.args).toContain("--die-with-parent");
+  });
+
+  it("masks .env file with ro-bind /dev/null instead of tmpfs", () => {
+    const result = wrapWithSandbox(
+      baseSandboxConfig(),
+      "claude",
+      ["--print"],
+    );
+    if (result.command !== "bwrap") return;
+
+    const root = "/home/test/.paperclip/instances/default";
+
+    // .env must NOT be in tmpfs (tmpfs fails on files, only works on dirs)
+    const tmpfsIndexes: number[] = [];
+    result.args.forEach((arg, i) => {
+      if (arg === "--tmpfs") tmpfsIndexes.push(i);
+    });
+    const tmpfsPaths = tmpfsIndexes.map((i) => result.args[i + 1]);
+    expect(tmpfsPaths).not.toContain(`${root}/.env`);
+
+    // .env must be masked with --ro-bind /dev/null
+    const roBindTriples: Array<[string, string]> = [];
+    result.args.forEach((arg, i) => {
+      if (arg === "--ro-bind") {
+        roBindTriples.push([result.args[i + 1]!, result.args[i + 2]!]);
+      }
+    });
+    const devNullBinds = roBindTriples.filter(([src]) => src === "/dev/null");
+    const maskedPaths = devNullBinds.map(([, dest]) => dest);
+    expect(maskedPaths).toContain(`${root}/.env`);
+  });
+
+  it("masks config.json file with ro-bind /dev/null instead of tmpfs", () => {
+    const result = wrapWithSandbox(
+      baseSandboxConfig(),
+      "claude",
+      ["--print"],
+    );
+    if (result.command !== "bwrap") return;
+
+    const root = "/home/test/.paperclip/instances/default";
+
+    // config.json must NOT be in tmpfs
+    const tmpfsIndexes: number[] = [];
+    result.args.forEach((arg, i) => {
+      if (arg === "--tmpfs") tmpfsIndexes.push(i);
+    });
+    const tmpfsPaths = tmpfsIndexes.map((i) => result.args[i + 1]);
+    expect(tmpfsPaths).not.toContain(`${root}/config.json`);
+
+    // config.json must be masked with --ro-bind /dev/null
+    const roBindTriples: Array<[string, string]> = [];
+    result.args.forEach((arg, i) => {
+      if (arg === "--ro-bind") {
+        roBindTriples.push([result.args[i + 1]!, result.args[i + 2]!]);
+      }
+    });
+    const devNullBinds = roBindTriples.filter(([src]) => src === "/dev/null");
+    const maskedPaths = devNullBinds.map(([, dest]) => dest);
+    expect(maskedPaths).toContain(`${root}/config.json`);
+  });
+
+  it("directory-type sensitive paths use tmpfs, not ro-bind /dev/null", () => {
+    const result = wrapWithSandbox(
+      baseSandboxConfig(),
+      "claude",
+      ["--print"],
+    );
+    if (result.command !== "bwrap") return;
+
+    const root = "/home/test/.paperclip/instances/default";
+
+    // Directories should still use tmpfs
+    const tmpfsIndexes: number[] = [];
+    result.args.forEach((arg, i) => {
+      if (arg === "--tmpfs") tmpfsIndexes.push(i);
+    });
+    const tmpfsPaths = tmpfsIndexes.map((i) => result.args[i + 1]);
+    expect(tmpfsPaths).toContain(`${root}/secrets`);
+    expect(tmpfsPaths).toContain(`${root}/db`);
+    expect(tmpfsPaths).toContain(`${root}/workspaces`);
+    expect(tmpfsPaths).toContain(`${root}/companies`);
   });
 });

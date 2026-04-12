@@ -1,4 +1,5 @@
 /// <reference path="./types/express.d.ts" />
+// heartbeat prompt passthrough fix applied 2026-04-07T07:00
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
@@ -586,6 +587,10 @@ export async function startServer(): Promise<StartedServer> {
       .catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
+    // Terminate ghost agents (never heartbeated, stale clones) at startup.
+    void heartbeat.cleanupGhostAgents().catch((err) => {
+      logger.error({ err }, "ghost agent cleanup failed");
+    });
     setInterval(() => {
       void heartbeat
         .tickTimers(new Date())
@@ -616,6 +621,116 @@ export async function startServer(): Promise<StartedServer> {
         .then(() => heartbeat.resumeQueuedRuns())
         .catch((err) => {
           logger.error({ err }, "periodic heartbeat recovery failed");
+        });
+
+      // Clear execution locks on done/cancelled issues — PAX-411 cruft cleanup
+      // and race-condition catch-all.  Safe and idempotent.
+      void heartbeat.clearTerminalIssueLocks().catch((err) => {
+        logger.error({ err }, "clearTerminalIssueLocks sweep failed");
+      });
+
+      // Watchdog: alert COO about runs stuck ≥10 minutes (queued/running). 10-min
+      // threshold matches the task-slicing rule; COO is exempt so it can't
+      // watchdog itself.
+      void heartbeat
+        .sweepStuckRuns()
+        .then((result) => {
+          if (result.filed > 0) {
+            logger.warn({ ...result }, "watchdog: stuck-run sweep filed COO alerts");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "watchdog stuck-run sweep failed");
+        });
+
+      // Blocking-chain sweep: find root blockers with high fan-out, escalate
+      // priority to critical, detect circular deps, and alert COO.
+      void heartbeat
+        .sweepBlockingChains()
+        .then((result) => {
+          if (result.escalated > 0 || result.cyclesDetected > 0) {
+            logger.warn({ ...result }, "blocking-chain sweep completed with actions");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "blocking-chain sweep failed");
+        });
+
+      // Stale review sweep: nudge agents with in_review issues ≥4h,
+      // escalate to COO at ≥12h.
+      void heartbeat
+        .sweepStaleReviews()
+        .then((result) => {
+          if (result.nudged > 0 || result.escalated > 0) {
+            logger.info({ ...result }, "stale-review sweep completed with actions");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "stale-review sweep failed");
+        });
+
+      // Reap stranded wakeup requests: promote stale deferred executions
+      // whose issues are now unlocked, cancel stale queued requests.
+      void heartbeat
+        .reapStrandedWakeupRequests()
+        .then((result) => {
+          if (result.promoted > 0 || result.cancelledDeferred > 0 || result.cancelledQueued > 0) {
+            logger.info({ ...result }, "stranded-wakeup reaper completed");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "stranded-wakeup reaper failed");
+        });
+
+      // Deduplicate routine-spawned issues — cancel extras, keep newest per routine.
+      void heartbeat
+        .deduplicateRoutineIssues()
+        .then((result) => {
+          if (result.cancelled > 0) {
+            logger.info({ ...result }, "routine issue dedup completed");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "routine issue dedup failed");
+        });
+
+      // COO self-watchdog: detect unresponsive COO, nudge after 2h, escalate
+      // to CTO after 6h.  Closes the "who watches the watchman" gap.
+      void heartbeat
+        .sweepCOOHealth()
+        .then((result) => {
+          if (result.nudged > 0 || result.escalated > 0) {
+            logger.warn({ ...result }, "coo-health sweep completed with actions");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "coo-health sweep failed");
+        });
+
+      // Queue depth sweep: alert COO when any agent has >3 queued wakeups,
+      // signaling a serialization bottleneck.
+      void heartbeat
+        .sweepAgentQueueDepth()
+        .then((result) => {
+          if (result.alerted > 0) {
+            logger.warn({ ...result }, "queue-depth sweep completed with alerts");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "queue-depth sweep failed");
+        });
+
+      // Wasted run detector: flag agents where ≥8/10 recent runs were no-ops
+      // (low output tokens), so COO can investigate root cause.
+      void heartbeat
+        .sweepWastedRunPatterns()
+        .then((result) => {
+          if (result.alerted > 0) {
+            logger.warn({ ...result }, "wasted-run sweep completed with alerts");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "wasted-run sweep failed");
         });
     }, config.heartbeatSchedulerIntervalMs);
   }

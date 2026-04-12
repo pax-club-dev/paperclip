@@ -130,6 +130,8 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+// Queued runs older than this are considered stale and can be adopted
+const STALE_QUEUED_RUN_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 
 function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, "\\$&");
@@ -862,12 +864,18 @@ export function issueService(db: Db) {
 
   async function isTerminalOrMissingHeartbeatRun(runId: string) {
     const run = await db
-      .select({ status: heartbeatRuns.status })
+      .select({ status: heartbeatRuns.status, createdAt: heartbeatRuns.createdAt })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
-    return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+    // Treat queued runs older than threshold as stale — they were never started
+    if (run.status === "queued" && run.createdAt) {
+      const ageMs = Date.now() - new Date(run.createdAt).getTime();
+      if (ageMs > STALE_QUEUED_RUN_THRESHOLD_MS) return true;
+    }
+    return false;
   }
 
   async function adoptStaleCheckoutRun(input: {
@@ -1825,6 +1833,47 @@ export function issueService(db: Db) {
         return enriched;
       }
 
+      // Fallback: issue has a stale executionRunId from a queued run that never
+      // started or a succeeded run that didn't release its lock. Adopt it in a
+      // single UPDATE guarded on the stale run id, so concurrent checkouts can't
+      // race each other.
+      if (
+        checkoutRunId &&
+        current.executionRunId &&
+        current.executionRunId !== checkoutRunId &&
+        (current.assigneeAgentId === agentId || current.assigneeAgentId == null) &&
+        expectedStatuses.includes(current.status)
+      ) {
+        const executionRunStale = await isTerminalOrMissingHeartbeatRun(current.executionRunId);
+        if (executionRunStale) {
+          const retryNow = new Date();
+          const adopted = await db
+            .update(issues)
+            .set({
+              assigneeAgentId: agentId,
+              assigneeUserId: null,
+              checkoutRunId,
+              executionRunId: checkoutRunId,
+              status: "in_progress",
+              startedAt: retryNow,
+              updatedAt: retryNow,
+            })
+            .where(
+              and(
+                eq(issues.id, id),
+                eq(issues.executionRunId, current.executionRunId),
+                inArray(issues.status, expectedStatuses),
+              ),
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (adopted) {
+            const [enriched] = await withIssueLabels(db, [adopted]);
+            return enriched;
+          }
+        }
+      }
+
       throw conflict("Issue checkout conflict", {
         issueId: current.id,
         status: current.status,
@@ -1920,6 +1969,9 @@ export function issueService(db: Db) {
           status: "todo",
           assigneeAgentId: null,
           checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
           updatedAt: new Date(),
         })
         .where(eq(issues.id, id))

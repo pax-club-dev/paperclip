@@ -485,7 +485,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
+    // Claude Code needs rw access to ~/.claude/ (session-env, settings, plans)
+    // and ~/.claude.json (global state) to function inside the sandbox.
+    const homeForClaude = effectiveEnv.HOME || os.homedir();
+    const claudeConfigDir = effectiveEnv.CLAUDE_CONFIG_DIR || path.join(homeForClaude, ".claude");
+    const claudeRwPaths = [claudeConfigDir];
+    // ~/.claude.json is a separate file at the home root — bind-mount it rw if
+    // it already exists (bwrap requires the source to exist for file binds).
+    const claudeJsonPath = path.join(homeForClaude, ".claude.json");
+    try {
+      await fs.access(claudeJsonPath);
+      claudeRwPaths.push(claudeJsonPath);
+    } catch {
+      // File doesn't exist yet — Claude Code will create it inside ~/.claude/
+    }
     const sandbox = buildSandboxConfig(config, context, cwd, {
+      additionalRwPaths: claudeRwPaths,
       additionalRoPaths: [skillsDir],
     });
 

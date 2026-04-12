@@ -571,6 +571,7 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
   }
 
   async function findLiveExecutionIssue(routine: typeof routines.$inferSelect, executor: Db = db) {
+    // Path 1: issue has executionRunId pointing at a live heartbeat run
     const executionBoundIssue = await executor
       .select()
       .from(issues)
@@ -595,7 +596,8 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
       .then((rows) => rows[0]?.issues ?? null);
     if (executionBoundIssue) return executionBoundIssue;
 
-    return executor
+    // Path 2: issue has no executionRunId yet but a live run references it via contextSnapshot
+    const contextBoundIssue = await executor
       .select()
       .from(issues)
       .innerJoin(
@@ -618,6 +620,27 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
+    if (contextBoundIssue) return contextBoundIssue;
+
+    // Path 3: any open issue for this routine — catches freshly-created issues
+    // whose executionRunId hasn't been set yet (wakeup deferred or in-flight).
+    // Without this, a 30-second scheduler tick can create a duplicate issue
+    // for every tick while executionRunId remains null.
+    return executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, "routine_execution"),
+          eq(issues.originId, routine.id),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          isNull(issues.hiddenAt),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
