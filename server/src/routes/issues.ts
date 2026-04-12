@@ -45,11 +45,33 @@ import {
   workProductService,
 } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
-import { forbidden, HttpError, unauthorized } from "../errors.js";
+import { forbidden, HttpError, unauthorized, unprocessable } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+
+function assertVerificationEvidence(commentBody: string | undefined): void {
+  if (!commentBody) {
+    throw unprocessable("Transitioning to done requires a comment with a ## Verification section");
+  }
+  const hasSection = /^## Verification\b/im.test(commentBody);
+  if (!hasSection) {
+    throw unprocessable("Transitioning to done requires a ## Verification section in the closing comment");
+  }
+  const methodMatch = commentBody.match(/\*?\*?Method\*?\*?:\s*(.+)/i);
+  const evidenceMatch = commentBody.match(/\*?\*?Evidence\*?\*?:\s*(.+)/i);
+  const confirmedMatch = commentBody.match(/(?:Confirmed[ _]working|confirmed_working):\s*(.+)/i);
+  if (!methodMatch) {
+    throw unprocessable("Verification section must include a Method field");
+  }
+  if (!evidenceMatch) {
+    throw unprocessable("Verification section must include an Evidence field");
+  }
+  if (!confirmedMatch || !["yes", "true"].includes(confirmedMatch[1].trim().toLowerCase())) {
+    throw unprocessable("Verification section must include Confirmed working: yes");
+  }
+}
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -1282,6 +1304,12 @@ export function issueRoutes(
     }
     if (commentBody && reopenRequested === true && isClosed && updateFields.status === undefined) {
       updateFields.status = "todo";
+    }
+    // PAX-81: Verification gate - agents must provide evidence when closing issues
+    if (updateFields.status === "done" && existing.status !== "done") {
+      if (req.actor.type !== "board") {
+        assertVerificationEvidence(commentBody);
+      }
     }
     let issue;
     try {
