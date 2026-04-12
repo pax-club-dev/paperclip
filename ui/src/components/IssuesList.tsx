@@ -15,6 +15,7 @@ import { PriorityIcon } from "./PriorityIcon";
 import { EmptyState } from "./EmptyState";
 import { Identity } from "./Identity";
 import { IssueRow } from "./IssueRow";
+import { EtaCountdown } from "./EtaCountdown";
 import { PageSkeleton } from "./PageSkeleton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -43,7 +44,7 @@ export type IssueViewState = {
   assignees: string[];
   labels: string[];
   projects: string[];
-  sortField: "status" | "priority" | "title" | "created" | "updated";
+  sortField: "status" | "priority" | "title" | "created" | "updated" | "eta";
   sortDir: "asc" | "desc";
   groupBy: "status" | "priority" | "assignee" | "none";
   viewMode: "list" | "board";
@@ -128,6 +129,11 @@ function sortIssues(issues: Issue[], state: IssueViewState): Issue[] {
         return dir * (new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
       case "updated":
         return dir * (new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
+      case "eta": {
+        const aEta = a.etaAt ? new Date(a.etaAt).getTime() : Infinity;
+        const bEta = b.etaAt ? new Date(b.etaAt).getTime() : Infinity;
+        return dir * (aEta - bEta);
+      }
       default:
         return 0;
     }
@@ -577,6 +583,7 @@ export function IssuesList({
                     ["title", "Title"],
                     ["created", "Created"],
                     ["updated", "Updated"],
+                    ["eta", "ETA"],
                   ] as const).map(([field, label]) => (
                     <button
                       key={field}
@@ -767,6 +774,7 @@ export function IssuesList({
                         mobileMeta={timeAgo(issue.updatedAt)}
                         desktopTrailing={(
                           <>
+                            <EtaCountdown issueId={issue.id} etaAt={issue.etaAt} className="hidden w-[72px] shrink-0 text-right sm:inline" />
                             {(issue.labels ?? []).length > 0 && (
                               <span className="hidden items-center gap-1 overflow-hidden md:flex md:max-w-[240px]">
                                 {(issue.labels ?? []).slice(0, 3).map((label) => (

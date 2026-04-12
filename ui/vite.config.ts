@@ -11,6 +11,9 @@ export default defineConfig({
       lexical: path.resolve(__dirname, "./node_modules/lexical/Lexical.mjs"),
     },
   },
+  optimizeDeps: {
+    include: ["@xyflow/react", "@dagrejs/dagre"],
+  },
   server: {
     port: 5173,
     // WSL2 /mnt/ drives don't support inotify — fall back to polling so HMR works

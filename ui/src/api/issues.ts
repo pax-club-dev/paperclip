@@ -187,4 +187,42 @@ export const issuesApi = {
   updateWorkProduct: (id: string, data: Record<string, unknown>) =>
     api.patch<IssueWorkProduct>(`/work-products/${id}`, data),
   deleteWorkProduct: (id: string) => api.delete<IssueWorkProduct>(`/work-products/${id}`),
+  dependencyGraph: (
+    companyId: string,
+    filters?: { status?: string; assigneeAgentId?: string; priority?: string },
+  ) => {
+    const params = new URLSearchParams();
+    if (filters?.status) params.set("status", filters.status);
+    if (filters?.assigneeAgentId) params.set("assigneeAgentId", filters.assigneeAgentId);
+    if (filters?.priority) params.set("priority", filters.priority);
+    const qs = params.toString();
+    return api.get<DependencyGraphResponse>(
+      `/companies/${companyId}/issues/dependency-graph${qs ? `?${qs}` : ""}`,
+    );
+  },
 };
+
+export interface DependencyGraphNode {
+  id: string;
+  identifier: string | null;
+  title: string;
+  status: string;
+  priority: string | null;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  assigneeAgent: { name: string; icon: string | null } | null;
+  parentId: string | null;
+  projectId: string | null;
+}
+
+export interface DependencyGraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  resolved: boolean;
+}
+
+export interface DependencyGraphResponse {
+  nodes: DependencyGraphNode[];
+  edges: DependencyGraphEdge[];
+}

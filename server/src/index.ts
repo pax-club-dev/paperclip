@@ -1,6 +1,7 @@
 /// <reference path="./types/express.d.ts" />
 // heartbeat prompt passthrough fix applied 2026-04-07T07:00
 import { existsSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -397,14 +398,71 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn("Removing stale embedded PostgreSQL lock file");
           rmSync(postmasterPidFile, { force: true });
         }
-        try {
-          await embeddedPostgres.start();
-        } catch (err) {
-          logEmbeddedPostgresFailure("start", err);
-          throw formatEmbeddedPostgresError(err, {
-            fallbackMessage: `Failed to start embedded PostgreSQL on port ${port}`,
-            recentLogs: logBuffer.getRecentLogs(),
-          });
+
+        // Retry loop: handles the race condition during dev-watch restarts
+        // where the previous postgres instance hasn't fully released its
+        // shared memory when the new server process starts.
+        const PG_START_MAX_RETRIES = 5;
+        const PG_START_RETRY_DELAY_MS = 2_000;
+        let pgStartAttempt = 0;
+        while (true) {
+          try {
+            await embeddedPostgres.start();
+            break; // success
+          } catch (err) {
+            pgStartAttempt++;
+            const recentLogs = logBuffer.getRecentLogs();
+            const logText = recentLogs.join("\n");
+            const isSharedMemoryConflict =
+              logText.includes("pre-existing shared memory block") ||
+              logText.includes("could not create shared memory segment") ||
+              logText.includes("is still in use");
+
+            if (!isSharedMemoryConflict || pgStartAttempt >= PG_START_MAX_RETRIES) {
+              logEmbeddedPostgresFailure("start", err);
+              throw formatEmbeddedPostgresError(err, {
+                fallbackMessage: `Failed to start embedded PostgreSQL on port ${port}`,
+                recentLogs,
+              });
+            }
+
+            logger.warn(
+              { attempt: pgStartAttempt, maxRetries: PG_START_MAX_RETRIES },
+              "Embedded PostgreSQL shared memory conflict (previous instance still shutting down); waiting to retry",
+            );
+
+            // Try to kill the old postgres process holding the shared memory
+            const stalePid = getRunningPid();
+            if (stalePid) {
+              logger.warn({ pid: stalePid }, "Sending SIGTERM to stale postgres process");
+              try { process.kill(stalePid, "SIGTERM"); } catch { /* already gone */ }
+            }
+
+            // Clean up SYSV shared memory segments owned by this user
+            try {
+              const ipcsOut = execFileSync("ipcs", ["-m"], { encoding: "utf-8", timeout: 5_000 });
+              for (const line of ipcsOut.split("\n")) {
+                // Match lines like: 0x0010c636 1835062 hash_na... 600 ...
+                const cols = line.trim().split(/\s+/);
+                if (cols.length >= 3 && /^\d+$/.test(cols[1])) {
+                  const shmId = cols[1];
+                  try {
+                    execFileSync("ipcrm", ["-m", shmId], { timeout: 5_000 });
+                    logger.info({ shmId }, "Cleaned up orphaned shared memory segment");
+                  } catch { /* segment in use or already removed */ }
+                }
+              }
+            } catch {
+              // ipcs/ipcrm not available or failed — not critical
+            }
+
+            // Remove postmaster.pid again if it reappeared
+            if (existsSync(postmasterPidFile)) {
+              rmSync(postmasterPidFile, { force: true });
+            }
+
+            await new Promise((r) => setTimeout(r, PG_START_RETRY_DELAY_MS));
+          }
         }
         embeddedPostgresStartedByThisProcess = true;
       }
@@ -850,7 +908,23 @@ export async function startServer(): Promise<StartedServer> {
   });
   
   {
+    let shuttingDown = false;
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+      if (shuttingDown) {
+        // Second signal → force exit immediately
+        process.exit(1);
+      }
+      shuttingDown = true;
+
+      // Hard deadline: if graceful shutdown takes >8s, force exit.
+      // This prevents the process from hanging when postgres.stop() blocks,
+      // which would cause tsx watch to SIGKILL us (losing cleanup entirely).
+      const forceExitTimer = setTimeout(() => {
+        logger.error("Graceful shutdown timed out after 8s, forcing exit");
+        process.exit(1);
+      }, 8_000);
+      forceExitTimer.unref();
+
       const telemetryClient = getTelemetryClient();
       if (telemetryClient) {
         telemetryClient.stop();
@@ -869,10 +943,10 @@ export async function startServer(): Promise<StartedServer> {
       process.exit(0);
     };
 
-    process.once("SIGINT", () => {
+    process.on("SIGINT", () => {
       void shutdown("SIGINT");
     });
-    process.once("SIGTERM", () => {
+    process.on("SIGTERM", () => {
       void shutdown("SIGTERM");
     });
   }

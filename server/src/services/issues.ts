@@ -1306,6 +1306,10 @@ export function issueService(db: Db) {
       return relations.get(issueId) ?? { blockedBy: [], blocks: [] };
     },
 
+    getRelationSummariesBatch: async (companyId: string, issueIds: string[]) => {
+      return getIssueRelationSummaryMap(companyId, issueIds, db);
+    },
+
     listWakeableBlockedDependents: async (blockerIssueId: string) => {
       const blockerIssue = await db
         .select({ id: issues.id, companyId: issues.companyId })
@@ -1431,6 +1435,9 @@ export function issueService(db: Db) {
       }
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
+      }
+      if (data.status === "blocked" && (!blockedByIssueIds || blockedByIssueIds.length === 0)) {
+        throw unprocessable("Setting status to 'blocked' requires at least one blockedByIssueId. Specify which issue(s) are blocking this one.");
       }
       return db.transaction(async (tx) => {
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
@@ -1605,6 +1612,22 @@ export function issueService(db: Db) {
 
       if (issueData.status) {
         assertTransition(existing.status, issueData.status);
+        // Correct by construction: "blocked" requires at least one blocker
+        if (issueData.status === "blocked") {
+          const hasNewBlockers = Array.isArray(blockedByIssueIds) && blockedByIssueIds.length > 0;
+          if (!hasNewBlockers) {
+            const existingBlockers = await db
+              .select({ id: issueRelations.id })
+              .from(issueRelations)
+              .where(and(eq(issueRelations.relatedIssueId, id), eq(issueRelations.type, "blocks")))
+              .limit(1);
+            if (existingBlockers.length === 0) {
+              throw unprocessable(
+                "Setting status to 'blocked' requires at least one blockedByIssueId. Specify which issue(s) are blocking this one.",
+              );
+            }
+          }
+        }
       }
 
       const patch: Partial<typeof issues.$inferInsert> = {

@@ -312,6 +312,94 @@ export function issueRoutes(
     }
   });
 
+  // Dependency graph: returns nodes + edges for issue blocker relationships
+  router.get("/companies/:companyId/issues/dependency-graph", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    const statusFilter = req.query.status as string | undefined;
+    const assigneeFilter = req.query.assigneeAgentId as string | undefined;
+    const priorityFilter = req.query.priority as string | undefined;
+
+    // Fetch all issues for the company
+    let allIssues = await svc.list(companyId, {
+      includeRoutineExecutions: false,
+    });
+
+    // Apply optional filters for the graph view
+    if (statusFilter) {
+      const statuses = new Set(statusFilter.split(","));
+      allIssues = allIssues.filter((i: { status: string }) => statuses.has(i.status));
+    }
+    if (assigneeFilter) {
+      allIssues = allIssues.filter((i: { assigneeAgentId: string | null }) => i.assigneeAgentId === assigneeFilter);
+    }
+    if (priorityFilter) {
+      const priorities = new Set(priorityFilter.split(","));
+      allIssues = allIssues.filter((i: { priority: string | null }) => i.priority && priorities.has(i.priority));
+    }
+
+    const issueIds = allIssues.map((i: { id: string }) => i.id);
+    const issueIdSet = new Set(issueIds);
+
+    // Fetch all blocker relations for the visible issues
+    const relations = issueIds.length > 0
+      ? await svc.getRelationSummariesBatch(companyId, issueIds)
+      : new Map();
+
+    // Fetch agent names for display
+    const agentIds = [...new Set(allIssues.map((i: { assigneeAgentId: string | null }) => i.assigneeAgentId).filter(Boolean))] as string[];
+    const agentMap = new Map<string, { name: string; icon: string | null }>();
+    if (agentIds.length > 0) {
+      const agentsList = await agentsSvc.list(companyId);
+      for (const a of agentsList) {
+        agentMap.set(a.id, { name: a.name, icon: a.icon });
+      }
+    }
+
+    // Build nodes
+    const nodes = allIssues.map((issue: {
+      id: string;
+      identifier: string | null;
+      title: string;
+      status: string;
+      priority: string | null;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+      parentId: string | null;
+      projectId: string | null;
+      description: string | null;
+    }) => ({
+      id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      status: issue.status,
+      priority: issue.priority,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
+      assigneeAgent: issue.assigneeAgentId ? agentMap.get(issue.assigneeAgentId) ?? null : null,
+      parentId: issue.parentId,
+      projectId: issue.projectId,
+    }));
+
+    // Build edges from blocker relationships (only edges where both ends are in the visible set)
+    const edges: { id: string; from: string; to: string; resolved: boolean }[] = [];
+    for (const [issueId, rel] of relations) {
+      for (const blocker of rel.blockedBy) {
+        if (issueIdSet.has(blocker.id)) {
+          edges.push({
+            id: `${blocker.id}->${issueId}`,
+            from: blocker.id,
+            to: issueId,
+            resolved: blocker.status === "done" || blocker.status === "cancelled",
+          });
+        }
+      }
+    }
+
+    res.json({ nodes, edges });
+  });
+
   // Common malformed path when companyId is empty in "/api/companies/{companyId}/issues".
   router.get("/issues", (_req, res) => {
     res.status(400).json({
@@ -1066,8 +1154,12 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
+    const { etaAt: etaAtCreateRaw, ...createFields } = req.body;
+    if (etaAtCreateRaw !== undefined) {
+      (createFields as Record<string, unknown>).etaAt = etaAtCreateRaw ? new Date(etaAtCreateRaw) : null;
+    }
     const issue = await svc.create(companyId, {
-      ...req.body,
+      ...createFields,
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
     });
@@ -1140,6 +1232,7 @@ export function issueRoutes(
       reopen: reopenRequested,
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
+      etaAt: etaAtRaw,
       ...updateFields
     } = req.body;
     let interruptedRunId: string | null = null;
@@ -1183,6 +1276,9 @@ export function issueRoutes(
 
     if (hiddenAtRaw !== undefined) {
       updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
+    }
+    if (etaAtRaw !== undefined) {
+      updateFields.etaAt = etaAtRaw ? new Date(etaAtRaw) : null;
     }
     if (commentBody && reopenRequested === true && isClosed && updateFields.status === undefined) {
       updateFields.status = "todo";

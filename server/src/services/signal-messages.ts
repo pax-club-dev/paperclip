@@ -58,3 +58,8 @@ export function signalMessageService(db: Db) {
           signalTimestamp: (value.signalTimestamp as number) ?? null,
           routedToAgentId: (value.routedToAgentId as string) ?? null,
           createdAt: (value.createdAt as string) ?? row.updatedAt.toISOString(),
+        };
+      });
+    },
+  };
+}

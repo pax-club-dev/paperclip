@@ -1,6 +1,7 @@
 import {
   Inbox,
   CircleDot,
+  GitBranch,
   Target,
   LayoutDashboard,
   DollarSign,
@@ -99,6 +100,7 @@ export function Sidebar() {
 
         <SidebarSection label="Work">
           <SidebarNavItem to="/issues" label="Issues" icon={CircleDot} />
+          <SidebarNavItem to="/graph" label="Graph" icon={GitBranch} />
           <SidebarNavItem to="/routines" label="Routines" icon={Repeat} textBadge="Beta" textBadgeTone="amber" />
           <SidebarNavItem to="/goals" label="Goals" icon={Target} />
         </SidebarSection>
