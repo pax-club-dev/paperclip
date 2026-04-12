@@ -9,6 +9,7 @@ import {
   feedbackTargetTypeSchema,
   feedbackTraceStatusSchema,
   feedbackVoteValueSchema,
+  declareCodeRedSchema,
   updateCompanyBrandingSchema,
   updateCompanySchema,
 } from "@paperclipai/shared";
@@ -21,6 +22,7 @@ import {
   companyPortabilityService,
   companyService,
   feedbackService,
+  issueService,
   logActivity,
 } from "../services/index.js";
 import type { StorageService } from "../storage/types.js";
@@ -368,6 +370,102 @@ export function companyRoutes(db: Db, storage?: StorageService) {
       details: req.body,
     });
     res.json(company);
+  });
+
+  // ---- Code Red endpoints ----
+
+  router.get("/:companyId/code-red", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const result = await svc.getCodeRed(companyId);
+    if (!result) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    res.json(result);
+  });
+
+  router.post("/:companyId/code-red", validate(declareCodeRedSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    // Only board users or CEO/COO agents can declare code red
+    if (req.actor.type === "agent") {
+      const agentSvc = agentService(db);
+      const actorAgent = req.actor.agentId ? await agentSvc.getById(req.actor.agentId) : null;
+      if (!actorAgent || !["ceo"].includes(actorAgent.role)) {
+        throw forbidden("Only CEO agents or board users may declare code red");
+      }
+    }
+
+    // Verify the issue exists and belongs to this company
+    const issueSvc = issueService(db);
+    const issue = await issueSvc.getById(req.body.issueId);
+    if (!issue || issue.companyId !== companyId) {
+      res.status(404).json({ error: "Issue not found in this company" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    const result = await svc.declareCodeRed(companyId, req.body.issueId, {
+      agentId: actor.agentId,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+    });
+    if (!result) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "company.code_red.declared",
+      entityType: "company",
+      entityId: companyId,
+      details: { issueId: req.body.issueId, issueIdentifier: issue.identifier },
+    });
+
+    res.json(result);
+  });
+
+  router.delete("/:companyId/code-red", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    // Only board users or CEO/COO agents can lift code red
+    if (req.actor.type === "agent") {
+      const agentSvc = agentService(db);
+      const actorAgent = req.actor.agentId ? await agentSvc.getById(req.actor.agentId) : null;
+      if (!actorAgent || !["ceo"].includes(actorAgent.role)) {
+        throw forbidden("Only CEO agents or board users may lift code red");
+      }
+    }
+
+    const actor = getActorInfo(req);
+    const previousState = await svc.getCodeRed(companyId);
+
+    const ok = await svc.liftCodeRed(companyId);
+    if (!ok) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "company.code_red.lifted",
+      entityType: "company",
+      entityId: companyId,
+      details: { previousIssueId: previousState?.issueId ?? null },
+    });
+
+    res.json({ active: false, issueId: null, declaredAt: null, declaredByAgentId: null, declaredByUserId: null });
   });
 
   router.post("/:companyId/archive", async (req, res) => {

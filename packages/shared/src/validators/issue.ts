@@ -43,6 +43,7 @@ export const createIssueSchema = z.object({
   parentId: z.string().uuid().optional().nullable(),
   blockedByIssueIds: z.array(z.string().uuid()).optional(),
   inheritExecutionWorkspaceFromIssueId: z.string().uuid().optional().nullable(),
+  eta: z.string().datetime().nullable().optional(),
   title: z.string().min(1),
   description: z.string().optional().nullable(),
   status: z.enum(ISSUE_STATUSES).optional().default("backlog"),

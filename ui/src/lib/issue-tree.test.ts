@@ -30,6 +30,7 @@ function makeIssue(id: string, parentId: string | null = null): Issue {
     executionRunId: null,
     executionAgentNameKey: null,
     executionLockedAt: null,
+    eta: null,
     startedAt: null,
     completedAt: null,
     cancelledAt: null,

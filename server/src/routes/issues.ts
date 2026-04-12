@@ -30,6 +30,7 @@ import { validate } from "../middleware/validate.js";
 import {
   accessService,
   agentService,
+  companyService,
   executionWorkspaceService,
   feedbackService,
   goalService,
@@ -485,7 +486,8 @@ export function issueRoutes(
         ? req.query.wakeCommentId.trim()
         : null;
 
-    const [{ project, goal }, ancestors, commentCursor, wakeComment, relations, attachments] =
+    const companySvc = companyService(db);
+    const [{ project, goal }, ancestors, commentCursor, wakeComment, relations, attachments, codeRed] =
       await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -493,6 +495,7 @@ export function issueRoutes(
       wakeCommentId ? svc.getComment(wakeCommentId) : null,
       svc.getRelationSummaries(issue.id),
       svc.listAttachments(issue.id),
+      companySvc.getCodeRed(issue.companyId),
     ]);
 
     res.json({
@@ -541,6 +544,9 @@ export function issueRoutes(
         wakeComment && wakeComment.issueId === issue.id
           ? wakeComment
           : null,
+      codeRed: codeRed?.active
+        ? { issueId: codeRed.issueId, declaredAt: codeRed.declaredAt }
+        : null,
       attachments: attachments.map((a) => ({
         id: a.id,
         filename: a.originalFilename,
@@ -1050,8 +1056,10 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
+    const { eta: etaRawCreate, ...createBody } = req.body;
     const issue = await svc.create(companyId, {
-      ...req.body,
+      ...createBody,
+      ...(etaRawCreate !== undefined ? { eta: etaRawCreate ? new Date(etaRawCreate) : null } : {}),
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
     });
@@ -1124,6 +1132,7 @@ export function issueRoutes(
       reopen: reopenRequested,
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
+      eta: etaRaw,
       ...updateFields
     } = req.body;
     let interruptedRunId: string | null = null;
@@ -1167,6 +1176,9 @@ export function issueRoutes(
 
     if (hiddenAtRaw !== undefined) {
       updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
+    }
+    if (etaRaw !== undefined) {
+      updateFields.eta = etaRaw ? new Date(etaRaw) : null;
     }
     if (commentBody && reopenRequested === true && isClosed && updateFields.status === undefined) {
       updateFields.status = "todo";

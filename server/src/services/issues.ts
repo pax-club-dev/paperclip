@@ -2485,5 +2485,39 @@ export function issueService(db: Db) {
         goal: a.goalId ? goalMap.get(a.goalId) ?? null : null,
       }));
     },
+
+    getBlockerRelationsForIssues: async (
+      companyId: string,
+      issueIds: string[],
+    ): Promise<Map<string, Array<{ blockerIssueId: string; blockerStatus: string }>>> => {
+      const uniqueIds = [...new Set(issueIds)];
+      const result = new Map<string, Array<{ blockerIssueId: string; blockerStatus: string }>>();
+      for (const id of uniqueIds) result.set(id, []);
+      if (uniqueIds.length === 0) return result;
+
+      const rows = await db
+        .select({
+          blockedIssueId: issueRelations.relatedIssueId,
+          blockerIssueId: issueRelations.issueId,
+          blockerStatus: issues.status,
+        })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.type, "blocks"),
+            inArray(issueRelations.relatedIssueId, uniqueIds),
+          ),
+        );
+
+      for (const row of rows) {
+        result.get(row.blockedIssueId)?.push({
+          blockerIssueId: row.blockerIssueId,
+          blockerStatus: row.blockerStatus,
+        });
+      }
+      return result;
+    },
   };
 }

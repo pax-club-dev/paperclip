@@ -19,7 +19,8 @@ import { formatDate, cn, projectUrl } from "../lib/utils";
 import { timeAgo } from "../lib/timeAgo";
 import { Separator } from "@/components/ui/separator";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { User, Hexagon, ArrowUpRight, Tag, Plus, Trash2 } from "lucide-react";
+import { User, Hexagon, ArrowUpRight, Tag, Plus, Trash2, Clock, X } from "lucide-react";
+import { formatEta } from "../lib/eta";
 import { AgentIcon } from "./AgentIconPicker";
 
 function defaultProjectWorkspaceIdForProject(project: {
@@ -595,6 +596,49 @@ export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProp
             onChange={(priority) => onUpdate({ priority })}
             showLabel
           />
+        </PropertyRow>
+
+        <PropertyRow label="ETA">
+          {issue.eta ? (
+            <div className="flex items-center gap-1.5">
+              <Clock className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+              <span className={cn("text-sm", formatEta(issue.eta).overdue && "text-red-600 dark:text-red-400 font-medium")}>
+                {formatEta(issue.eta).text}
+              </span>
+              <input
+                type="datetime-local"
+                className="text-xs bg-transparent outline-none border-b border-border w-[155px] cursor-pointer"
+                value={new Date(issue.eta).toISOString().slice(0, 16)}
+                onChange={(e) => {
+                  if (e.target.value) {
+                    onUpdate({ eta: new Date(e.target.value).toISOString() });
+                  }
+                }}
+              />
+              <button
+                type="button"
+                className="p-0.5 text-muted-foreground hover:text-destructive rounded"
+                onClick={() => onUpdate({ eta: null })}
+                title="Clear ETA"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-1.5">
+              <Clock className="h-3.5 w-3.5 text-muted-foreground" />
+              <input
+                type="datetime-local"
+                className="text-xs bg-transparent outline-none text-muted-foreground cursor-pointer"
+                placeholder="Set ETA"
+                onChange={(e) => {
+                  if (e.target.value) {
+                    onUpdate({ eta: new Date(e.target.value).toISOString() });
+                  }
+                }}
+              />
+            </div>
+          )}
         </PropertyRow>
 
         <PropertyPicker

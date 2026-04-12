@@ -21,6 +21,32 @@ describe("codex_local parser", () => {
       outputTokens: 4,
     });
     expect(parsed.errorMessage).toBe("model access denied");
+    expect(parsed.costUsd).toBeNull();
+  });
+
+  it("extracts total_cost_usd from turn.completed events", () => {
+    const stdout = [
+      JSON.stringify({ type: "thread.started", thread_id: "thread-456" }),
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "done" } }),
+      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 100, cached_input_tokens: 20, output_tokens: 50 }, total_cost_usd: 0.0342 }),
+    ].join("\n");
+
+    const parsed = parseCodexJsonl(stdout);
+    expect(parsed.costUsd).toBe(0.0342);
+    expect(parsed.usage).toEqual({
+      inputTokens: 100,
+      cachedInputTokens: 20,
+      outputTokens: 50,
+    });
+  });
+
+  it("ignores non-finite cost values", () => {
+    const stdout = [
+      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 }, total_cost_usd: NaN }),
+    ].join("\n");
+
+    const parsed = parseCodexJsonl(stdout);
+    expect(parsed.costUsd).toBeNull();
   });
 });
 

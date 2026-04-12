@@ -34,6 +34,7 @@ import {
   agentInstructionsService,
   accessService,
   approvalService,
+  companyService,
   companySkillService,
   budgetService,
   heartbeatService,
@@ -1081,13 +1082,60 @@ export function agentRoutes(db: Db) {
     }
 
     const issuesSvc = issueService(db);
-    const rows = await issuesSvc.list(req.actor.companyId, {
-      assigneeAgentId: req.actor.agentId,
-      status: "todo,in_progress,blocked",
+    const companySvc = companyService(db);
+    const [rows, codeRed] = await Promise.all([
+      issuesSvc.list(req.actor.companyId, {
+        assigneeAgentId: req.actor.agentId,
+        status: "todo,in_progress,blocked,in_review",
+      }),
+      companySvc.getCodeRed(req.actor.companyId),
+    ]);
+
+    // Batch-fetch blocker relations for topological sort
+    const issueIds = rows.map((r) => r.id);
+    const blockerMap = issueIds.length > 0
+      ? await issuesSvc.getBlockerRelationsForIssues(req.actor.companyId, issueIds)
+      : new Map<string, Array<{ blockerIssueId: string; blockerStatus: string }>>();
+
+    const statusTier: Record<string, number> = {
+      in_progress: 0,
+      in_review: 1,
+      todo: 2,
+      blocked: 3,
+    };
+    const priorityRank: Record<string, number> = {
+      critical: 0,
+      high: 1,
+      medium: 2,
+      low: 3,
+    };
+
+    const enriched = rows.map((issue) => {
+      const blockers = blockerMap.get(issue.id) ?? [];
+      const unresolvedBlockerCount = blockers.filter(
+        (b) => b.blockerStatus !== "done" && b.blockerStatus !== "cancelled",
+      ).length;
+      const dependencyReady = unresolvedBlockerCount === 0;
+      return { issue, dependencyReady, unresolvedBlockerCount };
     });
 
-    res.json(
-      rows.map((issue) => ({
+    enriched.sort((a, b) => {
+      const aTier = statusTier[a.issue.status] ?? 4;
+      const bTier = statusTier[b.issue.status] ?? 4;
+      if (aTier !== bTier) return aTier - bTier;
+      if (a.dependencyReady !== b.dependencyReady) return a.dependencyReady ? -1 : 1;
+      if (a.unresolvedBlockerCount !== b.unresolvedBlockerCount)
+        return a.unresolvedBlockerCount - b.unresolvedBlockerCount;
+      const aPri = priorityRank[a.issue.priority] ?? 4;
+      const bPri = priorityRank[b.issue.priority] ?? 4;
+      return aPri - bPri;
+    });
+
+    res.json({
+      codeRed: codeRed?.active
+        ? { issueId: codeRed.issueId, declaredAt: codeRed.declaredAt }
+        : null,
+      issues: enriched.map(({ issue, dependencyReady, unresolvedBlockerCount }) => ({
         id: issue.id,
         identifier: issue.identifier,
         title: issue.title,
@@ -1098,8 +1146,10 @@ export function agentRoutes(db: Db) {
         parentId: issue.parentId,
         updatedAt: issue.updatedAt,
         activeRun: issue.activeRun,
+        dependencyReady,
+        unresolvedBlockerCount,
       })),
-    );
+    });
   });
 
   router.get("/agents/me/inbox/mine", async (req, res) => {

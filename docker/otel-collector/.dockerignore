@@ -1,0 +1,12 @@
+# Ignore dev scripts and docs — not needed in image
+generate-dev-certs.sh
+cosign-sign.sh
+network-policy.yaml
+.dockerignore
+.gitignore
+README.md
+
+# Ignore actual cert private keys (mounted at runtime, not baked in)
+certs/*.key
+certs/*.csr
+certs/*.srl

@@ -1,6 +1,7 @@
-import type { DashboardSummary } from "@paperclipai/shared";
+import type { CycleTimeAnalytics, DashboardSummary } from "@paperclipai/shared";
 import { api } from "./client";
 
 export const dashboardApi = {
   summary: (companyId: string) => api.get<DashboardSummary>(`/companies/${companyId}/dashboard`),
+  cycleTimes: (companyId: string) => api.get<CycleTimeAnalytics>(`/companies/${companyId}/dashboard/cycle-times`),
 };

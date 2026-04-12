@@ -15,6 +15,14 @@
   "exports": {
     ".": "./src/index.ts",
     "./telemetry": "./src/telemetry/index.ts",
+    "./telemetry/otel-tracing": "./src/telemetry/otel-tracing.ts",
+    "./telemetry/otel-tracing.js": "./src/telemetry/otel-tracing.ts",
+    "./telemetry/audit-types": "./src/telemetry/audit-types.ts",
+    "./telemetry/audit-types.js": "./src/telemetry/audit-types.ts",
+    "./telemetry/signing-span-processor": "./src/telemetry/signing-span-processor.ts",
+    "./telemetry/signing-span-processor.js": "./src/telemetry/signing-span-processor.ts",
+    "./telemetry/faa-trace-enrichment": "./src/telemetry/faa-trace-enrichment.ts",
+    "./telemetry/faa-trace-enrichment.js": "./src/telemetry/faa-trace-enrichment.ts",
     "./*": "./src/*.ts"
   },
   "publishConfig": {
@@ -45,7 +53,16 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
     "zod": "^3.24.2"
+  },
+  "optionalDependencies": {
+    "@opentelemetry/sdk-trace-node": "^1.30.0",
+    "@opentelemetry/sdk-trace-base": "^1.30.0",
+    "@opentelemetry/resources": "^1.30.0",
+    "@opentelemetry/semantic-conventions": "^1.30.0",
+    "@opentelemetry/exporter-trace-otlp-grpc": "^0.57.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.57.0"
   },
   "devDependencies": {
     "typescript": "^5.7.3"

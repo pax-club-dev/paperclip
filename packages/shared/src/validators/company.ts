@@ -47,3 +47,9 @@ export const updateCompanyBrandingSchema = z
   );
 
 export type UpdateCompanyBranding = z.infer<typeof updateCompanyBrandingSchema>;
+
+export const declareCodeRedSchema = z.object({
+  issueId: z.string().uuid(),
+});
+
+export type DeclareCodeRed = z.infer<typeof declareCodeRedSchema>;

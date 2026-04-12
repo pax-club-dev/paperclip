@@ -3,6 +3,8 @@ import { useQuery } from "@tanstack/react-query";
 import { pickTextColorForPillBg } from "@/lib/color-contrast";
 import { useDialog } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
+import { compareEta } from "../lib/eta";
+import { EtaCountdown } from "./EtaCountdown";
 import { issuesApi } from "../api/issues";
 import { authApi } from "../api/auth";
 import { queryKeys } from "../lib/queryKeys";
@@ -43,7 +45,7 @@ export type IssueViewState = {
   assignees: string[];
   labels: string[];
   projects: string[];
-  sortField: "status" | "priority" | "title" | "created" | "updated";
+  sortField: "status" | "priority" | "title" | "created" | "updated" | "eta";
   sortDir: "asc" | "desc";
   groupBy: "status" | "priority" | "assignee" | "none";
   viewMode: "list" | "board";
@@ -128,6 +130,8 @@ function sortIssues(issues: Issue[], state: IssueViewState): Issue[] {
         return dir * (new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
       case "updated":
         return dir * (new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
+      case "eta":
+        return dir * compareEta(a.eta, b.eta);
       default:
         return 0;
     }
@@ -575,6 +579,7 @@ export function IssuesList({
                     ["status", "Status"],
                     ["priority", "Priority"],
                     ["title", "Title"],
+                    ["eta", "ETA"],
                     ["created", "Created"],
                     ["updated", "Updated"],
                   ] as const).map(([field, label]) => (
@@ -789,6 +794,9 @@ export function IssuesList({
                                 )}
                               </span>
                             )}
+                            <span className="hidden w-[90px] shrink-0 items-center justify-end md:inline-flex" onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}>
+                              <EtaCountdown issueId={issue.id} eta={issue.eta} />
+                            </span>
                             <Popover
                               open={assigneePickerIssueId === issue.id}
                               onOpenChange={(open) => {

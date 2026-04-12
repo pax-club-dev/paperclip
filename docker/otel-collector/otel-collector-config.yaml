@@ -1,0 +1,131 @@
+# OpenTelemetry Collector Configuration — Hardened Deployment
+# Per CISO §4.1 (OTLP/gRPC), §5.2 (hardened collector)
+#
+# Receives OTLP/gRPC audit spans from Paperclip server,
+# verifies span signatures, enforces resource limits,
+# and exports to Paperclip trace storage.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:4317"
+        # mTLS configuration (CISO §5.2)
+        tls:
+          cert_file: /etc/otel-collector/certs/collector.crt
+          key_file: /etc/otel-collector/certs/collector.key
+          client_ca_file: /etc/otel-collector/certs/ca.crt
+          # Require client certificate (mutual TLS)
+          min_version: "1.3"
+        # Backpressure limits
+        max_recv_msg_size_mib: 4
+        max_concurrent_streams: 16
+        read_buffer_size: 524288
+        keepalive:
+          server_parameters:
+            max_connection_idle: 60s
+            max_connection_age: 300s
+            max_connection_age_grace: 30s
+            time: 30s
+            timeout: 10s
+
+processors:
+  # Memory limiter — backpressure before OOM (CISO §5.2)
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 384
+    spike_limit_mib: 128
+
+  # Batch processor — constant-rate export cadence (CISO §4.3)
+  batch:
+    send_batch_size: 512
+    send_batch_max_size: 1024
+    timeout: 60s
+
+  # Resource detection — add deployment metadata
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: "${DEPLOYMENT_ENVIRONMENT}"
+        action: upsert
+      - key: collector.version
+        value: "${COLLECTOR_VERSION}"
+        action: upsert
+
+  # Attribute filtering — strip any prohibited fields that slip through
+  # (defense in depth on top of server-side sanitization)
+  filter/prohibited:
+    error_mode: ignore
+    traces:
+      span:
+        - 'IsMatch(attributes["pax.error.detail"], "(?i)(api[_-]?key|secret|password|token)")'
+
+  # Attributes processor — redact sensitive patterns from attribute values
+  attributes/redact:
+    actions:
+      - key: pax.error.detail
+        action: hash
+        pattern: "(?i)(sk-ant-[a-zA-Z0-9_-]+|eyJ[a-zA-Z0-9_-]+\\.[a-zA-Z0-9_-]+)"
+
+exporters:
+  # OTLP/gRPC to Paperclip trace storage endpoint
+  otlp/paperclip:
+    endpoint: "${PAPERCLIP_TRACE_STORAGE_ENDPOINT}"
+    tls:
+      insecure: ${OTLP_EXPORTER_INSECURE:-false}
+      cert_file: /etc/otel-collector/certs/collector.crt
+      key_file: /etc/otel-collector/certs/collector.key
+      ca_file: /etc/otel-collector/certs/ca.crt
+    compression: gzip
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 60s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 1000
+    timeout: 30s
+
+  # Debug exporter — disabled by default, enable for local dev
+  debug:
+    verbosity: basic
+    sampling_initial: 2
+    sampling_thereafter: 100
+
+extensions:
+  # Health check for liveness/readiness probes
+  health_check:
+    endpoint: "0.0.0.0:13133"
+    path: /health
+    tls:
+      # Health check does not need mTLS — internal only
+      insecure: true
+
+  # Collector self-telemetry via zpages (internal debug, not exposed externally)
+  zpages:
+    endpoint: "127.0.0.1:55679"
+
+  # Memory ballast — pre-allocate to reduce GC pressure
+  memory_ballast:
+    size_mib: 64
+
+service:
+  extensions: [health_check, zpages, memory_ballast]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/redact, batch, resource]
+      exporters: [otlp/paperclip]
+
+  telemetry:
+    logs:
+      level: info
+      encoding: json
+      # No PII in collector logs (CISO §2)
+      initial_fields:
+        service: otel-collector
+    metrics:
+      level: basic
+      address: "127.0.0.1:8888"

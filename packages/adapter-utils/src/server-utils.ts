@@ -461,6 +461,17 @@ export function buildSandboxConfig(
 
   const additionalRwPaths = [...(opts?.additionalRwPaths ?? [])];
   const additionalRoPaths = [...(opts?.additionalRoPaths ?? [])];
+  const workspaceAllowedRwPaths = Array.isArray(workspace.allowedRwPaths)
+    ? workspace.allowedRwPaths
+        .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+        .map((value) => value.trim())
+    : [];
+
+  for (const allowedPath of workspaceAllowedRwPaths) {
+    if (!additionalRwPaths.includes(allowedPath)) {
+      additionalRwPaths.push(allowedPath);
+    }
+  }
 
   // If the workspace has a worktree path, add it as rw
   const worktreePath = asString(workspace.worktreePath, "");
