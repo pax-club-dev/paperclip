@@ -139,30 +139,52 @@ export function hostPatchService(repoRoot?: string) {
       }
 
       // Phase 3: Typecheck (optional)
+      //
+      // Uses --project to target server tsconfig specifically (faster than
+      // whole-monorepo check). On failure, reverts via `git checkout` on
+      // the affected files rather than reverse-apply (more reliable).
       if (!opts.skipTypecheck) {
         logger.info({ targetDir, agent: opts.agentName }, "host-patch: running typecheck");
-        try {
-          await execFile("npx", ["tsc", "--noEmit"], {
-            cwd: targetDir,
-            timeout: 120_000,
-          });
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? (err as any).stderr ?? (err as any).stdout ?? err.message : String(err);
-          logger.error({ err: msg, agent: opts.agentName }, "host-patch: typecheck failed, reverting");
 
-          // Revert the patch since it doesn't typecheck
-          await execFile("git", ["apply", "--reverse", tmpPatch], {
+        // Determine which tsconfig(s) to check based on affected files
+        const tsconfigPaths = await findAffectedTsconfigs(targetDir, opts.patch);
+
+        let typecheckFailed = false;
+        let typecheckError = "";
+
+        for (const tsconfigPath of tsconfigPaths) {
+          try {
+            await execFile(
+              "npx",
+              ["tsc", "--noEmit", "--project", tsconfigPath],
+              { cwd: targetDir, timeout: 180_000 },
+            );
+          } catch (err: unknown) {
+            typecheckFailed = true;
+            const msg = err instanceof Error ? (err as any).stderr ?? (err as any).stdout ?? err.message : String(err);
+            typecheckError += `${tsconfigPath}:\n${msg}\n`;
+          }
+        }
+
+        if (typecheckFailed) {
+          logger.error(
+            { err: typecheckError.slice(0, 500), agent: opts.agentName },
+            "host-patch: typecheck failed, reverting",
+          );
+
+          // Revert via git checkout (more reliable than reverse-apply)
+          await execFile("git", ["checkout", "--", "."], {
             cwd: targetDir,
             timeout: 30_000,
           }).catch((revertErr) => {
-            logger.error({ err: revertErr }, "host-patch: failed to revert bad patch");
+            logger.error({ err: revertErr }, "host-patch: failed to revert bad patch via checkout");
           });
 
           return {
             ok: false,
             error: "Typecheck failed — patch reverted",
             phase: "typecheck",
-            details: truncate(msg, 4000),
+            details: truncate(typecheckError, 4000),
           };
         }
       }
@@ -322,6 +344,45 @@ function findRepoRoot(): string {
 
   // Last resort: cwd
   return cwd;
+}
+
+/**
+ * Parse a unified diff to find affected file paths, then map each to the
+ * nearest tsconfig.json. Returns a de-duplicated list of tsconfigs to check.
+ */
+async function findAffectedTsconfigs(repoRoot: string, patch: string): Promise<string[]> {
+  // Extract file paths from diff headers (--- a/foo and +++ b/foo)
+  const filePathPattern = /^[+-]{3} [ab]\/(.+)$/gm;
+  const files = new Set<string>();
+  let match: RegExpExecArray | null;
+  while ((match = filePathPattern.exec(patch)) !== null) {
+    if (match[1] !== "/dev/null") files.add(match[1]);
+  }
+
+  // For each file, walk up to find the nearest tsconfig.json
+  const tsconfigs = new Set<string>();
+  for (const file of files) {
+    if (!file.endsWith(".ts") && !file.endsWith(".tsx")) continue;
+    let dir = path.dirname(path.join(repoRoot, file));
+    while (dir.startsWith(repoRoot)) {
+      const candidate = path.join(dir, "tsconfig.json");
+      if (existsSync(candidate)) {
+        tsconfigs.add(candidate);
+        break;
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+
+  // Fallback: if we couldn't find any, check server tsconfig
+  if (tsconfigs.size === 0) {
+    const serverTsc = path.join(repoRoot, "server", "tsconfig.json");
+    if (existsSync(serverTsc)) tsconfigs.add(serverTsc);
+  }
+
+  return [...tsconfigs];
 }
 
 function truncate(s: string, max: number): string {
