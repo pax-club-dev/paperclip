@@ -15,6 +15,7 @@ import {
   resolveRuntimeSessionParamsForWorkspace,
   stripWorkspaceRuntimeFromExecutionRunConfig,
   shouldResetTaskSessionForWake,
+  stripPromotedCommentIdsFromSnapshot,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
 
@@ -385,6 +386,79 @@ describe("comment wake batching", () => {
   });
 });
 
+describe("comment-ID dedup across promotions", () => {
+  it("strips already-promoted comment IDs from deferred context snapshots", () => {
+    const deferred1: Record<string, unknown> = {
+      wakeReason: "issue_commented",
+      wakeCommentIds: ["comment-1", "comment-2", "comment-3"],
+      commentId: "comment-3",
+      wakeCommentId: "comment-3",
+    };
+    const deferred2: Record<string, unknown> = {
+      wakeReason: "issue_commented",
+      wakeCommentIds: ["comment-1", "comment-2", "comment-4"],
+      commentId: "comment-4",
+      wakeCommentId: "comment-4",
+    };
+    const deferred3: Record<string, unknown> = {
+      wakeReason: "issue_commented",
+      wakeCommentIds: ["comment-2", "comment-3", "comment-5"],
+      commentId: "comment-5",
+      wakeCommentId: "comment-5",
+    };
+
+    const promoted1 = extractWakeCommentIds(deferred1);
+    expect(promoted1).toEqual(["comment-1", "comment-2", "comment-3"]);
+    const seen = new Set(promoted1);
+
+    const changed2 = stripPromotedCommentIdsFromSnapshot(deferred2, seen);
+    expect(changed2).toBe(true);
+    expect(extractWakeCommentIds(deferred2)).toEqual(["comment-4"]);
+    expect(deferred2.commentId).toBe("comment-4");
+    expect(deferred2.wakeCommentId).toBe("comment-4");
+
+    for (const id of extractWakeCommentIds(deferred2)) seen.add(id);
+
+    const changed3 = stripPromotedCommentIdsFromSnapshot(deferred3, seen);
+    expect(changed3).toBe(true);
+    expect(extractWakeCommentIds(deferred3)).toEqual(["comment-5"]);
+    expect(deferred3.commentId).toBe("comment-5");
+    expect(deferred3.wakeCommentId).toBe("comment-5");
+  });
+
+  it("clears all comment fields when every ID was already promoted", () => {
+    const snapshot: Record<string, unknown> = {
+      wakeReason: "issue_commented",
+      wakeCommentIds: ["comment-1", "comment-2"],
+      commentId: "comment-2",
+      wakeCommentId: "comment-2",
+    };
+    const seen = new Set(["comment-1", "comment-2"]);
+
+    const changed = stripPromotedCommentIdsFromSnapshot(snapshot, seen);
+    expect(changed).toBe(true);
+    expect(extractWakeCommentIds(snapshot)).toEqual([]);
+    expect(snapshot.commentId).toBeUndefined();
+    expect(snapshot.wakeCommentId).toBeUndefined();
+  });
+
+  it("returns false when no comment IDs overlap with promoted set", () => {
+    const snapshot: Record<string, unknown> = {
+      wakeReason: "issue_commented",
+      wakeCommentIds: ["comment-5", "comment-6"],
+      commentId: "comment-6",
+      wakeCommentId: "comment-6",
+    };
+    const seen = new Set(["comment-1", "comment-2"]);
+
+    const changed = stripPromotedCommentIdsFromSnapshot(snapshot, seen);
+    expect(changed).toBe(false);
+    expect(extractWakeCommentIds(snapshot)).toEqual(["comment-5", "comment-6"]);
+    expect(snapshot.commentId).toBe("comment-6");
+    expect(snapshot.wakeCommentId).toBe("comment-6");
+  });
+});
+
 describe("buildExplicitResumeSessionOverride", () => {
   it("reuses saved task session params when they belong to the selected failed run", () => {
     const result = buildExplicitResumeSessionOverride({
@@ -482,12 +556,12 @@ describe("prioritizeProjectWorkspaceCandidatesForRun", () => {
 });
 
 describe("parseSessionCompactionPolicy", () => {
-  it("disables Paperclip-managed rotation by default for codex and claude local", () => {
+  it("uses codex thresholds and keeps claude adapter-managed by default", () => {
     expect(parseSessionCompactionPolicy(buildAgent("codex_local"))).toEqual({
       enabled: true,
-      maxSessionRuns: 0,
-      maxRawInputTokens: 0,
-      maxSessionAgeHours: 0,
+      maxSessionRuns: 25,
+      maxRawInputTokens: 1_000_000,
+      maxSessionAgeHours: 24,
     });
     expect(parseSessionCompactionPolicy(buildAgent("claude_local"))).toEqual({
       enabled: true,
@@ -528,7 +602,7 @@ describe("parseSessionCompactionPolicy", () => {
       enabled: true,
       maxSessionRuns: 25,
       maxRawInputTokens: 500_000,
-      maxSessionAgeHours: 0,
+      maxSessionAgeHours: 24,
     });
   });
 });

@@ -19,6 +19,7 @@ import {
   updateIssueWorkProductSchema,
   upsertIssueDocumentSchema,
   updateIssueSchema,
+  mergeIssueSchema,
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
   type ExecutionWorkspace,
@@ -359,6 +360,19 @@ export function issueRoutes(
       return;
     }
 
+    const limitRaw = typeof req.query.limit === "string" && req.query.limit.trim().length > 0
+      ? Number(req.query.limit)
+      : null;
+    const limit = limitRaw && Number.isFinite(limitRaw) && limitRaw > 0
+      ? Math.min(Math.floor(limitRaw), 200)
+      : undefined;
+    const offsetRaw = typeof req.query.offset === "string" && req.query.offset.trim().length > 0
+      ? Number(req.query.offset)
+      : null;
+    const offset = limit && offsetRaw !== null && Number.isFinite(offsetRaw) && offsetRaw >= 0
+      ? Math.floor(offsetRaw)
+      : undefined;
+
     const result = await svc.list(companyId, {
       status: req.query.status as string | undefined,
       assigneeAgentId: req.query.assigneeAgentId as string | undefined,
@@ -376,6 +390,8 @@ export function issueRoutes(
       includeRoutineExecutions:
         req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
       q: req.query.q as string | undefined,
+      limit,
+      offset,
     });
     res.json(result);
   });
@@ -1625,6 +1641,64 @@ export function issueRoutes(
     });
 
     res.json(released);
+  });
+
+  router.post("/issues/:id/merge", validate(mergeIssueSchema), async (req, res) => {
+    const survivorId = req.params.id as string;
+    const survivor = await svc.getById(survivorId);
+    if (!survivor) {
+      res.status(404).json({ error: "Survivor issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, survivor.companyId);
+
+    const { mergeIssueIds } = req.body as { mergeIssueIds: string[] };
+
+    const actor = getActorInfo(req);
+    const result = await svc.merge(survivorId, mergeIssueIds, {
+      agentId: actor.agentId,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+      runId: actor.runId,
+    });
+
+    await logActivity(db, {
+      companyId: survivor.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.merged",
+      entityType: "issue",
+      entityId: survivor.id,
+      details: {
+        survivorIdentifier: survivor.identifier,
+        mergedIssueIds: result.mergedIssueIds,
+        mergedIdentifiers: result.mergedIdentifiers,
+        transferredCommentCount: result.transferredCommentCount,
+        transferredAttachmentCount: result.transferredAttachmentCount,
+      },
+    });
+
+    for (const srcId of result.mergedIssueIds) {
+      const srcIdentifier = result.mergedIdentifiers[result.mergedIssueIds.indexOf(srcId)];
+      await logActivity(db, {
+        companyId: survivor.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.cancelled",
+        entityType: "issue",
+        entityId: srcId,
+        details: {
+          reason: "merged",
+          mergedInto: survivor.identifier,
+          identifier: srcIdentifier,
+        },
+      });
+    }
+
+    res.json(result);
   });
 
   router.get("/issues/:id/comments", async (req, res) => {

@@ -832,6 +832,30 @@ export function mergeCoalescedContextSnapshot(
   return merged;
 }
 
+/**
+ * Remove already-promoted comment IDs from a deferred wake context snapshot.
+ * Returns true if the snapshot was modified.
+ */
+export function stripPromotedCommentIdsFromSnapshot(
+  snapshot: Record<string, unknown>,
+  promotedIds: ReadonlySet<string>,
+): boolean {
+  const ids = extractWakeCommentIds(snapshot);
+  if (ids.length === 0) return false;
+  const filtered = ids.filter((id) => !promotedIds.has(id));
+  if (filtered.length === ids.length) return false;
+  if (filtered.length > 0) {
+    snapshot[WAKE_COMMENT_IDS_KEY] = filtered;
+    snapshot.commentId = filtered[filtered.length - 1];
+    snapshot.wakeCommentId = filtered[filtered.length - 1];
+  } else {
+    delete snapshot[WAKE_COMMENT_IDS_KEY];
+    delete snapshot.commentId;
+    delete snapshot.wakeCommentId;
+  }
+  return true;
+}
+
 async function buildPaperclipWakePayload(input: {
   db: Db;
   companyId: string;
@@ -2290,6 +2314,8 @@ export function heartbeatService(db: Db) {
     let filed = 0;
     let skipped = 0;
     const issueSvc = issueService(db);
+    // Track which COOs need a single wake after filing all alerts
+    const coosToWake = new Map<string, { companyId: string; issueIds: string[] }>();
     for (const s of stuck) {
       if (alreadyAlerted.has(`run:${s.runId}`)) {
         skipped += 1;
@@ -2351,26 +2377,35 @@ export function heartbeatService(db: Db) {
           },
           "watchdog: filed COO alert for stuck run",
         );
-        await enqueueWakeup(cooId, {
-          source: "assignment",
-          triggerDetail: "system",
-          reason: "issue_assigned",
-          payload: { issueId: created.id, mutation: "create" },
-          requestedByActorType: "system",
-          requestedByActorId: "watchdog_sweeper",
-          contextSnapshot: { issueId: created.id, source: "watchdog" },
-        }).catch((err) => {
-          logger.warn(
-            { err, watchdogIssueId: created.id, cooId },
-            "watchdog: failed to wake COO after filing alert",
-          );
-        });
+        // Collect COO wake — one wake per COO after all alerts filed
+        if (!coosToWake.has(cooId)) {
+          coosToWake.set(cooId, { companyId: s.companyId, issueIds: [] });
+        }
+        coosToWake.get(cooId)!.issueIds.push(created.id);
       } catch (err) {
         logger.warn(
           { err, runId: s.runId },
           "watchdog: failed to file COO alert for stuck run",
         );
       }
+    }
+
+    // Wake each COO at most once per sweep tick
+    for (const [cooId, { issueIds }] of coosToWake) {
+      await enqueueWakeup(cooId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: issueIds[0], mutation: "create" },
+        requestedByActorType: "system",
+        requestedByActorId: "watchdog_sweeper",
+        contextSnapshot: { issueIds, source: "watchdog", alertCount: issueIds.length },
+      }).catch((err) => {
+        logger.warn(
+          { err, cooId, alertCount: issueIds.length },
+          "watchdog: failed to wake COO after filing alerts",
+        );
+      });
     }
 
     if (filed > 0) {
@@ -2560,6 +2595,8 @@ export function heartbeatService(db: Db) {
 
       if (!cooRow) continue;
       const cooId = cooRow.id;
+      // Collect alert issue IDs for a single COO wake after all alerts filed
+      const cooAlertIssueIds = new Map<string, string[]>();
 
       // 7. Check existing alerts to avoid duplicates
       const originIds = [
@@ -2650,20 +2687,9 @@ export function heartbeatService(db: Db) {
             },
             "blocking-chain sweep: filed COO alert for root blocker",
           );
-          await enqueueWakeup(cooId, {
-            source: "assignment",
-            triggerDetail: "system",
-            reason: "issue_assigned",
-            payload: { issueId: created.id, mutation: "create" },
-            requestedByActorType: "system",
-            requestedByActorId: "blocking_chain_sweep",
-            contextSnapshot: { issueId: created.id, source: "blocking_chain_sweep" },
-          }).catch((err) => {
-            logger.warn(
-              { err, watchdogIssueId: created.id, cooId },
-              "blocking-chain sweep: failed to wake COO after filing alert",
-            );
-          });
+          // Collect for single wake after loop
+          if (!cooAlertIssueIds.has(cooId)) cooAlertIssueIds.set(cooId, []);
+          cooAlertIssueIds.get(cooId)!.push(created.id);
         } catch (err) {
           logger.warn(
             { err, rootBlockerId: rb.id },
@@ -2713,20 +2739,9 @@ export function heartbeatService(db: Db) {
               },
               "blocking-chain sweep: filed COO alert for circular dependency",
             );
-            await enqueueWakeup(cooId, {
-              source: "assignment",
-              triggerDetail: "system",
-              reason: "issue_assigned",
-              payload: { issueId: created.id, mutation: "create" },
-              requestedByActorType: "system",
-              requestedByActorId: "blocking_chain_sweep",
-              contextSnapshot: { issueId: created.id, source: "blocking_chain_sweep" },
-            }).catch((err) => {
-              logger.warn(
-                { err, cycleOriginId },
-                "blocking-chain sweep: failed to wake COO after cycle alert",
-              );
-            });
+            // Collect for single wake after loop
+            if (!cooAlertIssueIds.has(cooId)) cooAlertIssueIds.set(cooId, []);
+            cooAlertIssueIds.get(cooId)!.push(created.id);
           } catch (err) {
             logger.warn(
               { err, cycleSize: inCycle.size },
@@ -2736,6 +2751,24 @@ export function heartbeatService(db: Db) {
         } else {
           skipped += 1;
         }
+      }
+
+      // Wake each COO at most once per company per sweep tick
+      for (const [cId, alertIssueIds] of cooAlertIssueIds) {
+        await enqueueWakeup(cId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId: alertIssueIds[0], mutation: "create" },
+          requestedByActorType: "system",
+          requestedByActorId: "blocking_chain_sweep",
+          contextSnapshot: { issueIds: alertIssueIds, source: "blocking_chain_sweep", alertCount: alertIssueIds.length },
+        }).catch((err) => {
+          logger.warn(
+            { err, cooId: cId, alertCount: alertIssueIds.length },
+            "blocking-chain sweep: failed to wake COO after filing alerts",
+          );
+        });
       }
     }
 
@@ -2826,6 +2859,8 @@ export function heartbeatService(db: Db) {
     }
 
     const issueSvc = issueService(db);
+    // Track COO wakes — one per COO per sweep tick, not per alert
+    const cooAlertIds = new Map<string, string[]>();
 
     for (const issue of stale) {
       const ageMs = Date.now() - new Date(issue.updatedAt!).getTime();
@@ -2899,20 +2934,9 @@ export function heartbeatService(db: Db) {
             },
             "stale-review sweep: filed COO alert for stale in_review issue",
           );
-          await enqueueWakeup(cooId, {
-            source: "assignment",
-            triggerDetail: "system",
-            reason: "issue_assigned",
-            payload: { issueId: created.id, mutation: "create" },
-            requestedByActorType: "system",
-            requestedByActorId: "stale_review_sweep",
-            contextSnapshot: { issueId: created.id, source: "stale_review_sweep" },
-          }).catch((err) => {
-            logger.warn(
-              { err, watchdogIssueId: created.id, cooId },
-              "stale-review sweep: failed to wake COO after filing alert",
-            );
-          });
+          // Collect for single wake after loop
+          if (!cooAlertIds.has(cooId)) cooAlertIds.set(cooId, []);
+          cooAlertIds.get(cooId)!.push(created.id);
         } catch (err) {
           logger.warn(
             { err, issueId: issue.id },
@@ -2920,6 +2944,24 @@ export function heartbeatService(db: Db) {
           );
         }
       }
+    }
+
+    // Wake each COO at most once per sweep tick
+    for (const [cId, alertIssueIds] of cooAlertIds) {
+      await enqueueWakeup(cId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: alertIssueIds[0], mutation: "create" },
+        requestedByActorType: "system",
+        requestedByActorId: "stale_review_sweep",
+        contextSnapshot: { issueIds: alertIssueIds, source: "stale_review_sweep", alertCount: alertIssueIds.length },
+      }).catch((err) => {
+        logger.warn(
+          { err, cooId: cId, alertCount: alertIssueIds.length },
+          "stale-review sweep: failed to wake COO after filing alerts",
+        );
+      });
     }
 
     if (nudged > 0 || escalatedCount > 0) {
@@ -3501,6 +3543,7 @@ export function heartbeatService(db: Db) {
         ),
       );
     const alreadyAlerted = new Set(existingAlerts.map((e) => e.originId));
+    const queueCooAlerts = new Map<string, string[]>();
 
     for (const q of deep) {
       const agent = agentMap.get(q.agentId);
@@ -3562,26 +3605,32 @@ export function heartbeatService(db: Db) {
           },
           "queue-depth sweep: filed COO alert for deep queue",
         );
-        await enqueueWakeup(cooId, {
-          source: "assignment",
-          triggerDetail: "system",
-          reason: "issue_assigned",
-          payload: { issueId: created.id, mutation: "create" },
-          requestedByActorType: "system",
-          requestedByActorId: "queue_depth_sweep",
-          contextSnapshot: { issueId: created.id, source: "queue_depth_sweep" },
-        }).catch((err) => {
-          logger.warn(
-            { err, watchdogIssueId: created.id, cooId },
-            "queue-depth sweep: failed to wake COO after filing alert",
-          );
-        });
+        if (!queueCooAlerts.has(cooId)) queueCooAlerts.set(cooId, []);
+        queueCooAlerts.get(cooId)!.push(created.id);
       } catch (err) {
         logger.warn(
           { err, agentId: q.agentId },
           "queue-depth sweep: failed to file COO alert",
         );
       }
+    }
+
+    // Wake each COO at most once per sweep tick
+    for (const [cId, alertIssueIds] of queueCooAlerts) {
+      await enqueueWakeup(cId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: alertIssueIds[0], mutation: "create" },
+        requestedByActorType: "system",
+        requestedByActorId: "queue_depth_sweep",
+        contextSnapshot: { issueIds: alertIssueIds, source: "queue_depth_sweep", alertCount: alertIssueIds.length },
+      }).catch((err) => {
+        logger.warn(
+          { err, cooId: cId, alertCount: alertIssueIds.length },
+          "queue-depth sweep: failed to wake COO after filing alerts",
+        );
+      });
     }
 
     if (alerted > 0) {
@@ -3653,6 +3702,7 @@ export function heartbeatService(db: Db) {
         ),
       );
     const alreadyAlerted = new Set(existingAlerts.map((e) => e.originId));
+    const wastedCooAlerts = new Map<string, string[]>();
 
     for (const agent of activeAgents) {
       const originId = `wasted_runs:${agent.id}`;
@@ -3764,26 +3814,32 @@ export function heartbeatService(db: Db) {
           },
           "wasted-run sweep: filed COO alert for churning agent",
         );
-        await enqueueWakeup(cooId, {
-          source: "assignment",
-          triggerDetail: "system",
-          reason: "issue_assigned",
-          payload: { issueId: created.id, mutation: "create" },
-          requestedByActorType: "system",
-          requestedByActorId: "wasted_run_sweep",
-          contextSnapshot: { issueId: created.id, source: "wasted_run_sweep" },
-        }).catch((err) => {
-          logger.warn(
-            { err, watchdogIssueId: created.id, cooId },
-            "wasted-run sweep: failed to wake COO after filing alert",
-          );
-        });
+        if (!wastedCooAlerts.has(cooId)) wastedCooAlerts.set(cooId, []);
+        wastedCooAlerts.get(cooId)!.push(created.id);
       } catch (err) {
         logger.warn(
           { err, agentId: agent.id },
           "wasted-run sweep: failed to file COO alert",
         );
       }
+    }
+
+    // Wake each COO at most once per sweep tick
+    for (const [cId, alertIssueIds] of wastedCooAlerts) {
+      await enqueueWakeup(cId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: alertIssueIds[0], mutation: "create" },
+        requestedByActorType: "system",
+        requestedByActorId: "wasted_run_sweep",
+        contextSnapshot: { issueIds: alertIssueIds, source: "wasted_run_sweep", alertCount: alertIssueIds.length },
+      }).catch((err) => {
+        logger.warn(
+          { err, cooId: cId, alertCount: alertIssueIds.length },
+          "wasted-run sweep: failed to wake COO after filing alerts",
+        );
+      });
     }
 
     if (alerted > 0) {
@@ -4991,6 +5047,38 @@ export function heartbeatService(db: Db) {
             updatedAt: now,
           })
           .where(eq(issues.id, issue.id));
+
+        // Dedup: scrub promoted comment IDs from remaining deferred requests
+        // so subsequent promotions do not re-include the same comments.
+        const promotedCommentIds = extractWakeCommentIds(promotedContextSnapshot);
+        if (promotedCommentIds.length > 0) {
+          const promotedIdSet = new Set(promotedCommentIds);
+          const remainingDeferred = await tx
+            .select({
+              id: agentWakeupRequests.id,
+              payload: agentWakeupRequests.payload,
+            })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+              ),
+            );
+
+          for (const rem of remainingDeferred) {
+            const remPayload = parseObject(rem.payload);
+            const remContext = parseObject(remPayload[DEFERRED_WAKE_CONTEXT_KEY]);
+            if (stripPromotedCommentIdsFromSnapshot(remContext, promotedIdSet)) {
+              remPayload[DEFERRED_WAKE_CONTEXT_KEY] = remContext;
+              await tx
+                .update(agentWakeupRequests)
+                .set({ payload: remPayload, updatedAt: new Date() })
+                .where(eq(agentWakeupRequests.id, rem.id));
+            }
+          }
+        }
 
         return newRun;
       }

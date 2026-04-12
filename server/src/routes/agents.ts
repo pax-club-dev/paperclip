@@ -316,7 +316,11 @@ export function agentRoutes(db: Db) {
       "agents:create",
     );
     if (allowedByGrant || canCreateAgents(actorAgent)) return;
-    throw forbidden("Only CEO or agent creators can modify other agents");
+
+    const chainOfCommand = await svc.getChainOfCommand(targetAgent.id);
+    if (chainOfCommand.some((manager) => manager.id === actorAgent.id)) return;
+
+    throw forbidden("Only CEO, agent creators, or ancestor managers can modify other agents");
   }
 
   async function assertCanReadAgent(req: Request, targetAgent: { companyId: string }) {
@@ -591,6 +595,23 @@ export function agentRoutes(db: Db) {
     if (chainOfCommand.some((manager) => manager.id === actorAgent.id)) return;
 
     throw forbidden("Only the target agent or an ancestor manager can update instructions path");
+  }
+
+  async function assertCanInvokeHeartbeat(req: Request, targetAgent: { id: string; companyId: string }) {
+    assertCompanyAccess(req, targetAgent.companyId);
+    if (req.actor.type === "board") return;
+    if (!req.actor.agentId) throw forbidden("Agent authentication required");
+
+    const actorAgent = await svc.getById(req.actor.agentId);
+    if (!actorAgent || actorAgent.companyId !== targetAgent.companyId) {
+      throw forbidden("Agent key cannot access another company");
+    }
+    if (actorAgent.id === targetAgent.id) return;
+
+    const chainOfCommand = await svc.getChainOfCommand(targetAgent.id);
+    if (chainOfCommand.some((manager) => manager.id === actorAgent.id)) return;
+
+    throw forbidden("Only the target agent or an ancestor manager can invoke heartbeats");
   }
 
   function summarizeAgentUpdateDetails(patch: Record<string, unknown>) {
@@ -1110,13 +1131,14 @@ export function agentRoutes(db: Db) {
 
     const query = agentMineInboxQuerySchema.parse(req.query);
     const issuesSvc = issueService(db);
-    const rows = await issuesSvc.list(req.actor.companyId, {
+    const rawMineResult = await issuesSvc.list(req.actor.companyId, {
       touchedByUserId: query.userId,
       inboxArchivedByUserId: query.userId,
       status: query.status,
     });
+    const mineRows = Array.isArray(rawMineResult) ? rawMineResult : rawMineResult.items;
 
-    res.json(rows);
+    res.json(mineRows);
   });
 
   router.get("/agents/:id", async (req, res) => {
@@ -2077,12 +2099,7 @@ export function agentRoutes(db: Db) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    assertCompanyAccess(req, agent.companyId);
-
-    if (req.actor.type === "agent" && req.actor.agentId !== id) {
-      res.status(403).json({ error: "Agent can only invoke itself" });
-      return;
-    }
+    await assertCanInvokeHeartbeat(req, agent);
 
     const run = await heartbeat.wakeup(id, {
       source: req.body.source,
@@ -2127,12 +2144,7 @@ export function agentRoutes(db: Db) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    assertCompanyAccess(req, agent.companyId);
-
-    if (req.actor.type === "agent" && req.actor.agentId !== id) {
-      res.status(403).json({ error: "Agent can only invoke itself" });
-      return;
-    }
+    await assertCanInvokeHeartbeat(req, agent);
 
     const run = await heartbeat.invoke(
       id,

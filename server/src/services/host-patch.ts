@@ -385,6 +385,141 @@ async function findAffectedTsconfigs(repoRoot: string, patch: string): Promise<s
   return [...tsconfigs];
 }
 
+/**
+ * Scan added lines in a unified diff for `import … from '…'` and `require('…')`
+ * statements that reference npm packages not listed in any package.json in the
+ * repo. Returns the list of missing package names (e.g. `["@opentelemetry/api"]`).
+ */
+async function checkForMissingDependencies(
+  repoRoot: string,
+  patch: string,
+): Promise<string[]> {
+  // 1. Collect every npm package name imported in added lines
+  const imported = new Set<string>();
+
+  // Only look at added lines (start with "+", but not "+++ b/…" diff headers)
+  const addedLines = patch
+    .split("\n")
+    .filter((l) => l.startsWith("+") && !l.startsWith("+++"));
+
+  // ES import: import … from "pkg"  /  import "pkg"
+  const esImportRe = /\bimport\s+(?:[\s\S]*?\s+from\s+)?["']([^"']+)["']/g;
+  // CJS require: require("pkg")
+  const requireRe = /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g;
+
+  for (const line of addedLines) {
+    const raw = line.slice(1); // strip leading "+"
+    for (const re of [esImportRe, requireRe]) {
+      re.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(raw)) !== null) {
+        const specifier = m[1];
+        // Skip relative / absolute paths
+        if (specifier.startsWith(".") || specifier.startsWith("/")) continue;
+        // Extract bare package name (handle scoped packages)
+        const pkgName = specifier.startsWith("@")
+          ? specifier.split("/").slice(0, 2).join("/")
+          : specifier.split("/")[0];
+        imported.add(pkgName);
+      }
+    }
+  }
+
+  if (imported.size === 0) return [];
+
+  // 2. Skip Node built-in modules
+  const nodeBuiltins = new Set([
+    "assert", "async_hooks", "buffer", "child_process", "cluster",
+    "console", "constants", "crypto", "dgram", "diagnostics_channel",
+    "dns", "domain", "events", "fs", "http", "http2", "https",
+    "inspector", "module", "net", "os", "path", "perf_hooks",
+    "process", "punycode", "querystring", "readline", "repl",
+    "stream", "string_decoder", "sys", "timers", "tls", "trace_events",
+    "tty", "url", "util", "v8", "vm", "wasi", "worker_threads", "zlib",
+  ]);
+  for (const pkg of imported) {
+    if (pkg.startsWith("node:") || nodeBuiltins.has(pkg)) {
+      imported.delete(pkg);
+    }
+  }
+
+  if (imported.size === 0) return [];
+
+  // 3. Collect all declared dependencies from workspace package.json files
+  const declared = new Set<string>();
+
+  const pkgJsonPaths = await findWorkspacePackageJsons(repoRoot);
+  pkgJsonPaths.push(path.join(repoRoot, "package.json"));
+
+  for (const pjPath of pkgJsonPaths) {
+    try {
+      const raw = await readFile(pjPath, "utf-8");
+      const pkg = JSON.parse(raw);
+      for (const depField of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+        if (pkg[depField] && typeof pkg[depField] === "object") {
+          for (const name of Object.keys(pkg[depField])) {
+            declared.add(name);
+          }
+        }
+      }
+    } catch {
+      // Skip unreadable package.json
+    }
+  }
+
+  // 4. Return imported packages not found in any package.json
+  const missing: string[] = [];
+  for (const pkg of imported) {
+    if (!declared.has(pkg)) {
+      missing.push(pkg);
+    }
+  }
+
+  return missing.sort();
+}
+
+/**
+ * Find package.json files in the workspace (excluding node_modules).
+ * Walks known monorepo directories rather than a full glob.
+ */
+async function findWorkspacePackageJsons(repoRoot: string): Promise<string[]> {
+  const results: string[] = [];
+  const topDirs = ["server", "cli", "ui", "packages"];
+
+  for (const topDir of topDirs) {
+    const dir = path.join(repoRoot, topDir);
+    if (!existsSync(dir)) continue;
+
+    const candidate = path.join(dir, "package.json");
+    if (existsSync(candidate)) results.push(candidate);
+
+    // One level deeper (packages/shared, packages/db, etc.)
+    try {
+      const { stdout } = await execFile("ls", [dir], { timeout: 5_000 });
+      for (const sub of stdout.trim().split("\n").filter(Boolean)) {
+        const subPkg = path.join(dir, sub, "package.json");
+        if (existsSync(subPkg)) results.push(subPkg);
+
+        // Two levels for packages/adapters/*/package.json, packages/plugins/*/package.json
+        const subDir = path.join(dir, sub);
+        try {
+          const { stdout: inner } = await execFile("ls", [subDir], { timeout: 5_000 });
+          for (const deep of inner.trim().split("\n").filter(Boolean)) {
+            const deepPkg = path.join(subDir, deep, "package.json");
+            if (existsSync(deepPkg)) results.push(deepPkg);
+          }
+        } catch {
+          // Not a directory or no children
+        }
+      }
+    } catch {
+      // Not a directory
+    }
+  }
+
+  return results;
+}
+
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + "…" : s;
 }

@@ -36,6 +36,14 @@ const ADAPTER_MANAGED_SESSION_POLICY: SessionCompactionPolicy = {
   maxSessionAgeHours: 0,
 };
 
+// Codex does not compact natively, so enforce conservative rotation thresholds.
+const CODEX_SESSION_COMPACTION_POLICY: SessionCompactionPolicy = {
+  enabled: true,
+  maxSessionRuns: 25,
+  maxRawInputTokens: 1_000_000,
+  maxSessionAgeHours: 24,
+};
+
 export const LEGACY_SESSIONED_ADAPTER_TYPES = new Set([
   "claude_local",
   "codex_local",
@@ -54,8 +62,8 @@ export const ADAPTER_SESSION_MANAGEMENT: Record<string, AdapterSessionManagement
   },
   codex_local: {
     supportsSessionResume: true,
-    nativeContextManagement: "confirmed",
-    defaultSessionCompaction: ADAPTER_MANAGED_SESSION_POLICY,
+    nativeContextManagement: "none",
+    defaultSessionCompaction: CODEX_SESSION_COMPACTION_POLICY,
   },
   cursor: {
     supportsSessionResume: true,

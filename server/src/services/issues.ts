@@ -80,6 +80,8 @@ export interface IssueFilters {
   originId?: string;
   includeRoutineExecutions?: boolean;
   q?: string;
+  limit?: number;
+  offset?: number;
 }
 
 type IssueRow = typeof issues.$inferSelect;
@@ -1007,7 +1009,19 @@ export function issueService(db: Db) {
         END
       `;
       const canonicalLastActivityAt = issueCanonicalLastActivityAtExpr(companyId);
-      const rows = await db
+      const paginationLimit = filters?.limit && filters.limit > 0 ? Math.min(Math.floor(filters.limit), 200) : null;
+      const paginationOffset = paginationLimit && filters?.offset && filters.offset >= 0 ? Math.floor(filters.offset) : 0;
+
+      let totalCount: number | null = null;
+      if (paginationLimit) {
+        const [countRow] = await db
+          .select({ count: sql<number>`count(*)` })
+          .from(issues)
+          .where(and(...conditions));
+        totalCount = Number(countRow?.count ?? 0);
+      }
+
+      let query = db
         .select()
         .from(issues)
         .where(and(...conditions))
@@ -1017,6 +1031,10 @@ export function issueService(db: Db) {
           desc(canonicalLastActivityAt),
           desc(issues.updatedAt),
         );
+      if (paginationLimit) {
+        query = query.limit(paginationLimit).offset(paginationOffset) as typeof query;
+      }
+      const rows = await query;
       const withLabels = await withIssueLabels(db, rows);
       const runMap = await activeRunMapForIssues(db, withLabels);
       const withRuns = withActiveRuns(withLabels, runMap);
@@ -1125,7 +1143,7 @@ export function issueService(db: Db) {
       const lastActivityByIssueId = new Map(lastActivityRows.map((row) => [row.issueId, row]));
 
       if (!contextUserId) {
-        return withRuns.map((row) => {
+        const mapped = withRuns.map((row) => {
           const activity = lastActivityByIssueId.get(row.id);
           const lastActivityAt = latestIssueActivityAt(
             row.updatedAt,
@@ -1137,11 +1155,15 @@ export function issueService(db: Db) {
             lastActivityAt,
           };
         });
+        if (paginationLimit !== null && totalCount !== null) {
+          return { items: mapped, total: totalCount, limit: paginationLimit, offset: paginationOffset };
+        }
+        return mapped;
       }
 
       const readByIssueId = new Map(readRows.map((row) => [row.issueId, row.myLastReadAt]));
 
-      return withRuns.map((row) => {
+      const mapped = withRuns.map((row) => {
         const activity = lastActivityByIssueId.get(row.id);
         const lastActivityAt = latestIssueActivityAt(
           row.updatedAt,
@@ -1158,6 +1180,10 @@ export function issueService(db: Db) {
           }),
         };
       });
+      if (paginationLimit !== null && totalCount !== null) {
+        return { items: mapped, total: totalCount, limit: paginationLimit, offset: paginationOffset };
+      }
+      return mapped;
     },
 
     countUnreadTouchedByUser: async (companyId: string, userId: string, status?: string) => {
@@ -2484,6 +2510,173 @@ export function issueService(db: Db) {
         project: a.projectId ? projectMap.get(a.projectId) ?? null : null,
         goal: a.goalId ? goalMap.get(a.goalId) ?? null : null,
       }));
+    },
+
+    getBlockerRelationsForIssues: async (
+      companyId: string,
+      issueIds: string[],
+    ): Promise<Map<string, Array<{ blockerIssueId: string; blockerStatus: string }>>> => {
+      const uniqueIds = [...new Set(issueIds)];
+      const result = new Map<string, Array<{ blockerIssueId: string; blockerStatus: string }>>();
+      for (const id of uniqueIds) result.set(id, []);
+      if (uniqueIds.length === 0) return result;
+
+      const rows = await db
+        .select({
+          blockedIssueId: issueRelations.relatedIssueId,
+          blockerIssueId: issueRelations.issueId,
+          blockerStatus: issues.status,
+        })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.type, "blocks"),
+            inArray(issueRelations.relatedIssueId, uniqueIds),
+          ),
+        );
+
+      for (const row of rows) {
+        result.get(row.blockedIssueId)?.push({
+          blockerIssueId: row.blockerIssueId,
+          blockerStatus: row.blockerStatus,
+        });
+      }
+      return result;
+    },
+
+    merge: async (
+      survivorId: string,
+      mergeIssueIds: string[],
+      actor: { agentId?: string | null; userId?: string | null; runId?: string | null },
+    ) => {
+      const survivor = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, survivorId))
+        .then((rows) => rows[0] ?? null);
+      if (!survivor) throw notFound("Survivor issue not found");
+
+      const sourceIssues = await db
+        .select()
+        .from(issues)
+        .where(inArray(issues.id, mergeIssueIds));
+
+      if (sourceIssues.length !== mergeIssueIds.length) {
+        const foundIds = new Set(sourceIssues.map((i) => i.id));
+        const missing = mergeIssueIds.filter((id) => !foundIds.has(id));
+        throw notFound(`Source issues not found: ${missing.join(", ")}`);
+      }
+
+      for (const src of sourceIssues) {
+        if (src.companyId !== survivor.companyId) {
+          throw unprocessable(`Issue ${src.identifier} belongs to a different company`);
+        }
+        if (src.id === survivorId) {
+          throw unprocessable("Cannot merge an issue into itself");
+        }
+      }
+
+      const now = new Date();
+      const sourceIds = sourceIssues.map((i) => i.id);
+      const sourceIdentifiers = sourceIssues.map((i) => i.identifier).join(", ");
+
+      return db.transaction(async (tx) => {
+        // 1. Transfer comments from source issues to survivor
+        const transferredComments = await tx
+          .update(issueComments)
+          .set({ issueId: survivorId, updatedAt: now })
+          .where(inArray(issueComments.issueId, sourceIds))
+          .returning();
+
+        // 2. Transfer attachments from source issues to survivor
+        const transferredAttachments = await tx
+          .update(issueAttachments)
+          .set({ issueId: survivorId, updatedAt: now })
+          .where(inArray(issueAttachments.issueId, sourceIds))
+          .returning();
+
+        // 3. Re-point blocking relations: where source issues block others, point to survivor
+        await tx
+          .update(issueRelations)
+          .set({ issueId: survivorId, updatedAt: now })
+          .where(
+            and(
+              inArray(issueRelations.issueId, sourceIds),
+              ne(issueRelations.relatedIssueId, survivorId),
+            ),
+          );
+
+        // Re-point relations where source issues are blocked by others, point to survivor
+        await tx
+          .update(issueRelations)
+          .set({ relatedIssueId: survivorId, updatedAt: now })
+          .where(
+            and(
+              inArray(issueRelations.relatedIssueId, sourceIds),
+              ne(issueRelations.issueId, survivorId),
+            ),
+          );
+
+        // Remove any self-referential relations that may have been created
+        await tx
+          .delete(issueRelations)
+          .where(
+            and(
+              eq(issueRelations.issueId, survivorId),
+              eq(issueRelations.relatedIssueId, survivorId),
+            ),
+          );
+
+        // 4. Cancel source issues with merge metadata
+        const mergeNote = `\n\n---\n_Merged into ${survivor.identifier}_`;
+        await tx
+          .update(issues)
+          .set({
+            status: "cancelled",
+            cancelledAt: now,
+            updatedAt: now,
+            description: sql`coalesce(${issues.description}, '') || ${mergeNote}`,
+          })
+          .where(inArray(issues.id, sourceIds));
+
+        // 5. Add system comment on survivor noting the merge
+        const [mergeComment] = await tx
+          .insert(issueComments)
+          .values({
+            companyId: survivor.companyId,
+            issueId: survivorId,
+            authorAgentId: actor.agentId ?? null,
+            authorUserId: actor.userId ?? null,
+            createdByRunId: actor.runId ?? null,
+            body: `**Issue merge completed**\n\nMerged ${sourceIssues.length} issue(s) into this issue: ${sourceIdentifiers}\n\n- ${transferredComments.length} comment(s) transferred\n- ${transferredAttachments.length} attachment(s) transferred`,
+          })
+          .returning();
+
+        // 6. Update survivor's updatedAt
+        await tx
+          .update(issues)
+          .set({ updatedAt: now })
+          .where(eq(issues.id, survivorId));
+
+        const [enrichedSurvivor] = await withIssueLabels(tx, [
+          await tx
+            .select()
+            .from(issues)
+            .where(eq(issues.id, survivorId))
+            .then((rows) => rows[0]!),
+        ]);
+
+        return {
+          survivor: enrichedSurvivor,
+          mergedIssueIds: sourceIds,
+          mergedIdentifiers: sourceIssues.map((i) => i.identifier),
+          transferredCommentCount: transferredComments.length,
+          transferredAttachmentCount: transferredAttachments.length,
+          mergeComment,
+        };
+      });
     },
   };
 }

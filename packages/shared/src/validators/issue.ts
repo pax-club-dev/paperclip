@@ -125,6 +125,11 @@ export const upsertIssueDocumentSchema = z.object({
 
 export const restoreIssueDocumentRevisionSchema = z.object({});
 
+export const mergeIssueSchema = z.object({
+  mergeIssueIds: z.array(z.string().uuid()).min(1, "At least one issue to merge is required"),
+});
+export type MergeIssue = z.infer<typeof mergeIssueSchema>;
+
 export type IssueDocumentFormat = z.infer<typeof issueDocumentFormatSchema>;
 export type UpsertIssueDocument = z.infer<typeof upsertIssueDocumentSchema>;
 export type RestoreIssueDocumentRevision = z.infer<typeof restoreIssueDocumentRevisionSchema>;

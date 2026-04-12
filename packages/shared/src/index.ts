@@ -425,6 +425,7 @@ export {
   createIssueSchema,
   createIssueLabelSchema,
   updateIssueSchema,
+  mergeIssueSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,
   addIssueCommentSchema,
