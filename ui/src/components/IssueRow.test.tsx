@@ -43,7 +43,6 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
     executionRunId: null,
     executionAgentNameKey: null,
     executionLockedAt: null,
-    eta: null,
     startedAt: null,
     completedAt: null,
     cancelledAt: null,

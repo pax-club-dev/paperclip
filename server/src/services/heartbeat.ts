@@ -30,8 +30,6 @@ import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } fr
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
-import { auditTracing, type HeartbeatRunContext } from "./audit-tracing.js";
-import { getTraceSigningManager, extractJwtSignature } from "./trace-signing.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService } from "./secrets.js";
@@ -3916,9 +3914,6 @@ export function heartbeatService(db: Db) {
 
     activeRunExecutions.add(run.id);
 
-    const audit = auditTracing();
-    let auditCtx: HeartbeatRunContext | null = null;
-
     try {
     const agent = await getAgent(run.agentId);
     if (!agent) {
@@ -4027,15 +4022,6 @@ export function heartbeatService(db: Db) {
           executionWorkspacePreference: issueContext.executionWorkspacePreference,
         }
       : null;
-    auditCtx = {
-      runId,
-      agentId: agent.id,
-      companyId: agent.companyId,
-      issueId,
-      issueIdentifier: issueRef?.identifier,
-      adapterType: agent.adapterType,
-    };
-    audit.recordEvent(auditCtx, "heartbeat.start", "success");
     const paperclipWakePayload = await buildPaperclipWakePayload({
       db,
       companyId: agent.companyId,
@@ -4125,21 +4111,17 @@ export function heartbeatService(db: Db) {
           workspace: existingExecutionWorkspace,
         })
       : null;
-    const executionWorkspace = reusedExecutionWorkspace ?? await audit.traceWorkspaceSetup(
-          auditCtx!,
-          executionWorkspaceBase.source,
-          () => realizeExecutionWorkspace({
-            base: executionWorkspaceBase,
-            config: runtimeConfig,
-            issue: issueRef,
-            agent: {
-              id: agent.id,
-              name: agent.name,
-              companyId: agent.companyId,
-            },
-            recorder: workspaceOperationRecorder,
-          }),
-        );
+    const executionWorkspace = reusedExecutionWorkspace ?? await realizeExecutionWorkspace({
+          base: executionWorkspaceBase,
+          config: runtimeConfig,
+          issue: issueRef,
+          agent: {
+            id: agent.id,
+            name: agent.name,
+            companyId: agent.companyId,
+          },
+          recorder: workspaceOperationRecorder,
+        });
     const resolvedProjectId = executionWorkspace.projectId ?? issueRef?.projectId ?? executionProjectId ?? null;
     const resolvedProjectWorkspaceId = issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId ?? null;
     let persistedExecutionWorkspace = null;
@@ -4323,17 +4305,6 @@ export function heartbeatService(db: Db) {
       instanceRoot,
       companyDir: path.resolve(instanceRoot, "companies", agent.companyId),
       homeDir: os.homedir(),
-      allowedRwPaths: (() => {
-        const runtimeConfig = parseObject(agent.runtimeConfig);
-        const isolationConfig = parseObject(runtimeConfig.isolation);
-        const rawPaths = Array.isArray(isolationConfig.allowedPaths)
-          ? isolationConfig.allowedPaths
-          : [];
-        const normalized = rawPaths
-          .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-          .map((value) => path.resolve(value.trim()));
-        return normalized.length > 0 ? normalized : undefined;
-      })(),
     };
     context.paperclipWorkspaces = resolvedWorkspace.workspaceHints;
     const runtimeServiceIntents = (() => {
@@ -4497,7 +4468,7 @@ export function heartbeatService(db: Db) {
           (entry): entry is [string, string] => typeof entry[0] === "string" && typeof entry[1] === "string",
         ),
       );
-      const runtimeServices = await audit.traceWorkspaceSetup(auditCtx!, "runtime-services", () => ensureRuntimeServicesForRun({
+      const runtimeServices = await ensureRuntimeServicesForRun({
         db,
         runId: run.id,
         agent: {
@@ -4511,7 +4482,7 @@ export function heartbeatService(db: Db) {
         config: resolvedConfig,
         adapterEnv,
         onLog,
-      }));
+      });
       if (runtimeServices.length > 0) {
         context.paperclipRuntimeServices = runtimeServices;
         context.paperclipRuntimePrimaryUrl =
@@ -4560,17 +4531,6 @@ export function heartbeatService(db: Db) {
       const authToken = adapter.supportsLocalAgentJwt
         ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, run.id)
         : null;
-      // Phase 2 (CISO §8.3): Derive Ed25519 signing key from the run JWT.
-      // Key exists only in memory for the heartbeat duration; zeroed in finally block.
-      if (authToken) {
-        const jwtSig = extractJwtSignature(authToken);
-        if (jwtSig) {
-          getTraceSigningManager()?.deriveRunKeyPair(run.id, jwtSig);
-        }
-      }
-      if (authToken && auditCtx) {
-        audit.recordAuthEvent(auditCtx, "auth.token_issued", "success");
-      }
       if (adapter.supportsLocalAgentJwt && !authToken) {
         logger.warn(
           {
@@ -4582,7 +4542,7 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
-      const adapterResult = await audit.traceAdapterExecution(auditCtx!, () => adapter.execute({
+      const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
         runtime: runtimeForAdapter,
@@ -4594,7 +4554,7 @@ export function heartbeatService(db: Db) {
           await persistRunProcessMetadata(run.id, meta);
         },
         authToken: authToken ?? undefined,
-      }));
+      });
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,
@@ -4673,7 +4633,7 @@ export function heartbeatService(db: Db) {
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
-        logSummary = await audit.traceLogPersist(auditCtx!, () => runLogStore.finalize(handle!));
+        logSummary = await runLogStore.finalize(handle);
       }
 
       const status =
@@ -4774,9 +4734,9 @@ export function heartbeatService(db: Db) {
       }
 
       if (finalizedRun) {
-        await audit.traceCostReport(auditCtx!, () => updateRuntimeState(agent, finalizedRun, adapterResult, {
+        await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
-        }, normalizedUsage));
+        }, normalizedUsage);
         if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
             await clearTaskSessions(agent.companyId, agent.id, {
@@ -4798,13 +4758,6 @@ export function heartbeatService(db: Db) {
         }
       }
       await finalizeAgentStatus(agent.id, outcome);
-      if (auditCtx) {
-        audit.recordEvent(
-          auditCtx,
-          "heartbeat.complete",
-          outcome === "succeeded" ? "success" : outcome === "timed_out" ? "timeout" : "failure",
-        );
-      }
     } catch (err) {
       const message = redactCurrentUserText(
         err instanceof Error ? err.message : "Unknown adapter failure",
@@ -4869,9 +4822,6 @@ export function heartbeatService(db: Db) {
       }
 
       await finalizeAgentStatus(agent.id, "failed");
-      if (auditCtx) {
-        audit.recordEvent(auditCtx, "heartbeat.complete", "failure");
-      }
     }
     } catch (outerErr) {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
@@ -4902,12 +4852,7 @@ export function heartbeatService(db: Db) {
           // Ensure the agent is not left stuck in "running" if the inner catch handler's
           // DB calls threw (e.g. a transient DB error in finalizeAgentStatus).
           await finalizeAgentStatus(run.agentId, "failed").catch(() => undefined);
-          if (auditCtx) {
-            audit.recordEvent(auditCtx, "heartbeat.complete", "failure");
-          }
         } finally {
-          // Phase 2 (CISO §8.3): Zero and release per-run signing key material.
-          getTraceSigningManager()?.clearRunKey(run.id);
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);

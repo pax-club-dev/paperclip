@@ -31,6 +31,3 @@ export { notifyHireApproved, type NotifyHireApprovedInput } from "./hire-hook.js
 export { publishLiveEvent, subscribeCompanyLiveEvents } from "./live-events.js";
 export { reconcilePersistedRuntimeServicesOnStartup, restartDesiredRuntimeServicesOnStartup } from "./workspace-runtime.js";
 export { createStorageServiceFromConfig, getStorageService } from "../storage/index.js";
-export { auditExportService, ExportError } from "./audit-export.js";
-export { auditAlertService, ALERT_DEFINITIONS, type AlertType, type AlertSeverity } from "./audit-alerts.js";
-export { auditAnomalyDetectionService } from "./audit-anomaly-detection.js";

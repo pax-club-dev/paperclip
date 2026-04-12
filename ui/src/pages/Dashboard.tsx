@@ -22,7 +22,6 @@ import { cn, formatCents } from "../lib/utils";
 import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle } from "lucide-react";
 import { ActiveAgentsPanel } from "../components/ActiveAgentsPanel";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
-import { CycleTimeCharts } from "../components/CycleTimeCharts";
 import { PageSkeleton } from "../components/PageSkeleton";
 import type { Agent, Issue } from "@paperclipai/shared";
 import { PluginSlotOutlet } from "@/plugins/slots";
@@ -78,12 +77,6 @@ export function Dashboard() {
   const { data: runs } = useQuery({
     queryKey: queryKeys.heartbeats(selectedCompanyId!),
     queryFn: () => heartbeatsApi.list(selectedCompanyId!),
-    enabled: !!selectedCompanyId,
-  });
-
-  const { data: cycleTimes } = useQuery({
-    queryKey: queryKeys.dashboardCycleTimes(selectedCompanyId!),
-    queryFn: () => dashboardApi.cycleTimes(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
 
@@ -304,10 +297,6 @@ export function Dashboard() {
               <SuccessRateChart runs={runs ?? []} />
             </ChartCard>
           </div>
-
-          {cycleTimes && (
-            <CycleTimeCharts analytics={cycleTimes} />
-          )}
 
           <PluginSlotOutlet
             slotTypes={["dashboardWidget"]}

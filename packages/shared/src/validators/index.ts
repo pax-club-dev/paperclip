@@ -23,8 +23,6 @@ export {
   type CreateCompany,
   type UpdateCompany,
   type UpdateCompanyBranding,
-  declareCodeRedSchema,
-  type DeclareCodeRed,
 } from "./company.js";
 export {
   feedbackDataSharingPreferenceSchema,

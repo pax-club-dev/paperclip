@@ -46,10 +46,6 @@ export function companyService(db: Db) {
     feedbackDataSharingConsentByUserId: companies.feedbackDataSharingConsentByUserId,
     feedbackDataSharingTermsVersion: companies.feedbackDataSharingTermsVersion,
     brandColor: companies.brandColor,
-    codeRedIssueId: companies.codeRedIssueId,
-    codeRedDeclaredAt: companies.codeRedDeclaredAt,
-    codeRedDeclaredByAgentId: companies.codeRedDeclaredByAgentId,
-    codeRedDeclaredByUserId: companies.codeRedDeclaredByUserId,
     logoAssetId: companyLogos.assetId,
     createdAt: companies.createdAt,
     updatedAt: companies.updatedAt,
@@ -291,74 +287,6 @@ export function companyService(db: Db) {
           .returning();
         return rows[0] ?? null;
       }),
-
-    getCodeRed: async (companyId: string) => {
-      const row = await db
-        .select({
-          codeRedIssueId: companies.codeRedIssueId,
-          codeRedDeclaredAt: companies.codeRedDeclaredAt,
-          codeRedDeclaredByAgentId: companies.codeRedDeclaredByAgentId,
-          codeRedDeclaredByUserId: companies.codeRedDeclaredByUserId,
-        })
-        .from(companies)
-        .where(eq(companies.id, companyId))
-        .then((rows) => rows[0] ?? null);
-      if (!row) return null;
-      return {
-        active: row.codeRedIssueId !== null,
-        issueId: row.codeRedIssueId,
-        declaredAt: row.codeRedDeclaredAt,
-        declaredByAgentId: row.codeRedDeclaredByAgentId,
-        declaredByUserId: row.codeRedDeclaredByUserId,
-      };
-    },
-
-    declareCodeRed: async (
-      companyId: string,
-      issueId: string,
-      actor: { agentId?: string | null; userId?: string | null },
-    ) => {
-      const rows = await db
-        .update(companies)
-        .set({
-          codeRedIssueId: issueId,
-          codeRedDeclaredAt: new Date(),
-          codeRedDeclaredByAgentId: actor.agentId ?? null,
-          codeRedDeclaredByUserId: actor.userId ?? null,
-          updatedAt: new Date(),
-        })
-        .where(eq(companies.id, companyId))
-        .returning({
-          codeRedIssueId: companies.codeRedIssueId,
-          codeRedDeclaredAt: companies.codeRedDeclaredAt,
-          codeRedDeclaredByAgentId: companies.codeRedDeclaredByAgentId,
-          codeRedDeclaredByUserId: companies.codeRedDeclaredByUserId,
-        });
-      const row = rows[0];
-      if (!row) return null;
-      return {
-        active: true,
-        issueId: row.codeRedIssueId,
-        declaredAt: row.codeRedDeclaredAt,
-        declaredByAgentId: row.codeRedDeclaredByAgentId,
-        declaredByUserId: row.codeRedDeclaredByUserId,
-      };
-    },
-
-    liftCodeRed: async (companyId: string) => {
-      const rows = await db
-        .update(companies)
-        .set({
-          codeRedIssueId: null,
-          codeRedDeclaredAt: null,
-          codeRedDeclaredByAgentId: null,
-          codeRedDeclaredByUserId: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(companies.id, companyId))
-        .returning({ id: companies.id });
-      return rows.length > 0;
-    },
 
     stats: () =>
       Promise.all([

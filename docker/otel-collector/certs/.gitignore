@@ -1,7 +1,0 @@
-# Never commit real certificates or private keys
-*.key
-*.crt
-*.pem
-*.csr
-*.srl
-!.gitkeep

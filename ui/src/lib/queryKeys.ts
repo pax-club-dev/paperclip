@@ -75,9 +75,6 @@ export const queryKeys = {
     list: (companyId: string) => ["goals", companyId] as const,
     detail: (id: string) => ["goals", "detail", id] as const,
   },
-  steeringDirectives: {
-    list: (companyId: string) => ["steering-directives", companyId] as const,
-  },
   budgets: {
     overview: (companyId: string) => ["budgets", "overview", companyId] as const,
   },
@@ -107,7 +104,6 @@ export const queryKeys = {
     providers: (companyId: string) => ["secret-providers", companyId] as const,
   },
   dashboard: (companyId: string) => ["dashboard", companyId] as const,
-  dashboardCycleTimes: (companyId: string) => ["dashboard", companyId, "cycle-times"] as const,
   sidebarBadges: (companyId: string) => ["sidebar-badges", companyId] as const,
   activity: (companyId: string) => ["activity", companyId] as const,
   costs: (companyId: string, from?: string, to?: string) =>

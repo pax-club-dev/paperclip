@@ -40,7 +40,7 @@ import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
-import { initTelemetry, getTelemetryClient, initAuditTelemetry, shutdownAuditTelemetry } from "./telemetry.js";
+import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 
 type BetterAuthSessionUser = {
   id: string;
@@ -82,9 +82,6 @@ export interface StartedServer {
 export async function startServer(): Promise<StartedServer> {
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
-  // Initialize OpenTelemetry audit trail tracing (CLO/CISO requirements).
-  // Enabled via PAPERCLIP_AUDIT_TRAIL_ENABLED=true environment variable.
-  await initAuditTelemetry();
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
     process.env.PAPERCLIP_SECRETS_PROVIDER = config.secretsProvider;
   }
@@ -859,9 +856,6 @@ export async function startServer(): Promise<StartedServer> {
         telemetryClient.stop();
         await telemetryClient.flush();
       }
-
-      // Flush and shut down the OTel audit trail pipeline.
-      await shutdownAuditTelemetry();
 
       if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
         logger.info({ signal }, "Stopping embedded PostgreSQL");

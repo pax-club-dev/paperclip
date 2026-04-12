@@ -14,12 +14,5 @@ export function dashboardRoutes(db: Db) {
     res.json(summary);
   });
 
-  router.get("/companies/:companyId/dashboard/cycle-times", async (req, res) => {
-    const companyId = req.params.companyId as string;
-    assertCompanyAccess(req, companyId);
-    const analytics = await svc.cycleTimes(companyId);
-    res.json(analytics);
-  });
-
   return router;
 }

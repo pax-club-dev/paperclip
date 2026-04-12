@@ -611,7 +611,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       biller: resolveCodexBiller(effectiveEnv, billingType),
       model,
       billingType,
-      costUsd: attempt.parsed.costUsd,
+      costUsd: null,
       resultJson: {
         stdout: attempt.proc.stdout,
         stderr: attempt.proc.stderr,
