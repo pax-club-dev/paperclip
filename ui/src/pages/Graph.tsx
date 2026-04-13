@@ -179,14 +179,22 @@ const IssueNode = memo(function IssueNode({ data, selected }: NodeProps<Node<Iss
           </p>
 
           {/* Bottom row: assignee */}
-          <div className="flex items-center justify-end">
-            {initials && (
-              <div
-                className="w-5 h-5 rounded-full bg-muted flex items-center justify-center text-[8px] font-bold text-muted-foreground"
-                title={data.assigneeAgent?.name}
-              >
-                {initials}
-              </div>
+          <div className="flex items-center gap-1.5">
+            {data.assigneeAgent && (
+              <>
+                <div
+                  className="w-4 h-4 rounded-full bg-muted flex items-center justify-center text-[7px] font-bold text-muted-foreground shrink-0"
+                  title={data.assigneeAgent.name}
+                >
+                  {initials}
+                </div>
+                <span
+                  className="text-[10px] text-muted-foreground truncate"
+                  title={data.assigneeAgent.name}
+                >
+                  {data.assigneeAgent.name}
+                </span>
+              </>
             )}
           </div>
         </div>
