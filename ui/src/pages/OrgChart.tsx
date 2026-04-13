@@ -341,6 +341,28 @@ export function OrgChart() {
         </button>
       </div>
 
+      {/* Agent status legend */}
+      <div className="absolute bottom-3 left-3 z-10 bg-background/90 backdrop-blur-sm border border-border rounded-lg px-3 py-2 shadow-sm">
+        <div className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1.5">Agent Status</div>
+        <div className="flex flex-col gap-1">
+          {([
+            { color: "#22d3ee", label: "Running", pulse: true },
+            { color: "#4ade80", label: "Active", pulse: false },
+            { color: "#facc15", label: "Paused / Idle", pulse: false },
+            { color: "#f87171", label: "Error", pulse: false },
+            { color: "#a3a3a3", label: "Offline", pulse: false },
+          ] as const).map(({ color, label, pulse }) => (
+            <div key={label} className="flex items-center gap-1.5">
+              <span
+                className={`inline-block h-2.5 w-2.5 rounded-full shrink-0${pulse ? " animate-pulse" : ""}`}
+                style={{ backgroundColor: color }}
+              />
+              <span className="text-[11px] text-muted-foreground leading-none">{label}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
       {/* SVG layer for edges */}
       <svg
         className="absolute inset-0 pointer-events-none"
