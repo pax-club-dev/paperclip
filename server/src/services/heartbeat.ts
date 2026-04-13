@@ -64,6 +64,7 @@ import {
   resolveSessionCompactionPolicy,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
+import { quotaHealthService } from "./quota-health.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
@@ -1100,6 +1101,7 @@ function resolveNextSessionState(input: {
 
 export function heartbeatService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
+  const quotaHealth = quotaHealthService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
@@ -5003,6 +5005,12 @@ export function heartbeatService(db: Db) {
           }
         }
       }
+      if (outcome === "succeeded") {
+        void quotaHealth.checkAfterRun(agent.companyId);
+      } else if (adapterResult.errorMessage) {
+        void quotaHealth.handleCreditError(agent.companyId, agent.id, adapterResult.errorMessage);
+      }
+
       await finalizeAgentStatus(agent.id, outcome);
     } catch (err) {
       const message = redactCurrentUserText(
@@ -5066,6 +5074,8 @@ export function heartbeatService(db: Db) {
           });
         }
       }
+
+      void quotaHealth.handleCreditError(agent.companyId, agent.id, message);
 
       await finalizeAgentStatus(agent.id, "failed");
     }
