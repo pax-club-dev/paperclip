@@ -1983,12 +1983,33 @@ export function heartbeatService(db: Db) {
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // Resilience: only count runs this process is actually managing, OR runs
+  // younger than MAX_RUN_AGE_FOR_CAPACITY_MS.  Orphaned "running" DB rows
+  // (from crashes, killed processes, or runaway loops) cannot block dispatch
+  // longer than this threshold.  reapOrphanedRuns will clean them up; this
+  // ensures capacity isn't held hostage while waiting for the reaper.
+  // ---------------------------------------------------------------------------
+  const MAX_RUN_AGE_FOR_CAPACITY_MS = 10 * 60 * 1000; // 10 minutes
+
   async function countRunningRunsForAgent(agentId: string) {
-    const [{ count }] = await db
-      .select({ count: sql<number>`count(*)` })
+    const runs = await db
+      .select({ id: heartbeatRuns.id, startedAt: heartbeatRuns.startedAt })
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")));
-    return Number(count ?? 0);
+
+    const now = Date.now();
+    let count = 0;
+    for (const run of runs) {
+      // Always count runs this process is actively managing
+      if (activeRunExecutions.has(run.id)) { count++; continue; }
+      // Count DB-only runs if they're recent enough to plausibly be real
+      const age = run.startedAt ? now - new Date(run.startedAt).getTime() : Infinity;
+      if (age < MAX_RUN_AGE_FOR_CAPACITY_MS) { count++; continue; }
+      // Stale orphan — don't count against capacity
+      logger.debug({ runId: run.id, agentId, ageMs: age }, "countRunningRunsForAgent: ignoring stale orphan");
+    }
+    return count;
   }
 
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect) {
@@ -2100,9 +2121,13 @@ export function heartbeatService(db: Db) {
 
     if (nextStatus === "idle") {
       await autoWakeIdleAgentIfAssignableWork(agentId).catch((err) => {
-        logger.warn(
-          { err, agentId },
-          "failed to auto-wake idle agent with assignable work",
+        // Query-level errors (type mismatches, missing columns) are bugs, not
+        // transient failures.  Log at ERROR so they're impossible to miss.
+        const isQueryBug = err?.code && /^42/.test(String(err.code)); // PG class 42 = syntax/type errors
+        const level = isQueryBug ? "error" : "warn";
+        logger[level](
+          { err, agentId, pgCode: err?.code, message: err?.message },
+          `dag_dispatch: autoWakeIdleAgentIfAssignableWork failed${isQueryBug ? " — QUERY BUG, dispatch is broken until fixed" : ""}`,
         );
       });
     }
@@ -2195,7 +2220,7 @@ export function heartbeatService(db: Db) {
             SELECT 1 FROM ${heartbeatRuns} hr
             WHERE hr.agent_id = ${agentId}
               AND hr.status IN ('queued', 'running')
-              AND hr.context_snapshot ->> 'issueId' = ${issues.id}
+              AND hr.context_snapshot ->> 'issueId' = ${issues.id}::text
           )`,
         ),
       );
@@ -2264,8 +2289,22 @@ export function heartbeatService(db: Db) {
   // issues using DAG ranking and enqueue wakeups in parallel (up to available
   // slots). The NOT EXISTS check on heartbeat_runs prevents re-enqueuing issues
   // that already have an active run, closing the runaway loop.  PAX-2177.
+  //
+  // Resilience: per-agent cooldown prevents the tight re-dispatch loop where
+  // run-complete → dispatch → run-complete → dispatch fires every few seconds.
+  // Even if the dedup guard fails, the cooldown caps the damage rate.
   // ---------------------------------------------------------------------------
+  const MIN_DISPATCH_INTERVAL_MS = 5_000; // 5 seconds between dispatch batches per agent
+  const lastDispatchAt = new Map<string, number>();
+
   async function autoWakeIdleAgentIfAssignableWork(agentId: string) {
+    const now = Date.now();
+    const lastAt = lastDispatchAt.get(agentId) ?? 0;
+    if (now - lastAt < MIN_DISPATCH_INTERVAL_MS) {
+      logger.debug({ agentId, cooldownMs: MIN_DISPATCH_INTERVAL_MS - (now - lastAt) }, "dag_dispatch: skipping, cooldown active");
+      return;
+    }
+
     const ranked = await rankReadyIssuesForAgent(agentId);
     if (ranked.length === 0) return;
 
@@ -2298,6 +2337,8 @@ export function heartbeatService(db: Db) {
         requestedByActorId: "dag_dispatch",
       });
     }
+
+    lastDispatchAt.set(agentId, Date.now());
   }
 
   // ---------------------------------------------------------------------------
