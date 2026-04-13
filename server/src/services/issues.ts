@@ -66,6 +66,7 @@ function applyStatusSideEffects(
 
 export interface IssueFilters {
   status?: string;
+  priority?: string;
   assigneeAgentId?: string;
   participantAgentId?: string;
   assigneeUserId?: string;
@@ -950,6 +951,10 @@ export function issueService(db: Db) {
       }
       if (filters?.assigneeAgentId) {
         conditions.push(eq(issues.assigneeAgentId, filters.assigneeAgentId));
+      }
+      if (filters?.priority) {
+        const priorities = filters.priority.split(",").map((s) => s.trim());
+        conditions.push(priorities.length === 1 ? eq(issues.priority, priorities[0]) : inArray(issues.priority, priorities));
       }
       if (filters?.participantAgentId) {
         conditions.push(participatedByAgentCondition(companyId, filters.participantAgentId));

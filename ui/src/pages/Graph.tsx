@@ -272,9 +272,9 @@ export function Graph() {
     enabled: !!selectedCompanyId,
   });
 
-  // Build React Flow nodes + edges
-  const { flowNodes, flowEdges, nodeMap, edgesByNode } = useMemo(() => {
-    if (!graphData) return { flowNodes: [], flowEdges: [], nodeMap: new Map(), edgesByNode: new Map() };
+  // Stage 1: compute layout (only re-runs when graph structure or showResolved changes)
+  const { layoutedNodes, layoutedEdges, nodeMap, edgesByNode } = useMemo(() => {
+    if (!graphData) return { layoutedNodes: [], layoutedEdges: [], nodeMap: new Map(), edgesByNode: new Map() };
 
     const nodeMap = new Map<string, DependencyGraphNode>();
     graphData.nodes.forEach((n) => nodeMap.set(n.id, n));
@@ -318,41 +318,38 @@ export function Graph() {
       },
     }));
 
-    // Search highlighting
-    const searchLower = debouncedSearch.toLowerCase().trim();
-
-    // Build flow nodes
-    const rawNodes: Node[] = graphData.nodes.map((n) => {
-      const matchesSearch =
-        !searchLower ||
-        (n.identifier?.toLowerCase().includes(searchLower) ?? false) ||
-        n.title.toLowerCase().includes(searchLower);
-
-      return {
-        id: n.id,
-        type: "issue",
-        data: {
-          ...n,
-          dimmed: searchLower ? !matchesSearch : false,
-          searchMatch: searchLower ? matchesSearch : false,
-        },
-        position: { x: 0, y: 0 },
-      };
-    });
+    // Build flow nodes (no search data yet — layout is search-independent)
+    const rawNodes: Node[] = graphData.nodes.map((n) => ({
+      id: n.id,
+      type: "issue",
+      data: { ...n, dimmed: false, searchMatch: false },
+      position: { x: 0, y: 0 },
+    }));
 
     // Apply dagre layout
-    const { nodes: layoutedNodes, edges: layoutedEdges } = getLayoutedElements(
-      rawNodes,
-      flowEdges,
-    );
+    const { nodes: ln, edges: le } = getLayoutedElements(rawNodes, flowEdges);
 
-    return {
-      flowNodes: layoutedNodes,
-      flowEdges: layoutedEdges,
-      nodeMap,
-      edgesByNode,
-    };
-  }, [graphData, showResolved, debouncedSearch]);
+    return { layoutedNodes: ln, layoutedEdges: le, nodeMap, edgesByNode };
+  }, [graphData, showResolved]);
+
+  // Stage 2: overlay search highlighting (cheap — no dagre recompute)
+  const flowNodes = useMemo(() => {
+    const searchLower = debouncedSearch.toLowerCase().trim();
+    if (!searchLower) return layoutedNodes;
+
+    return layoutedNodes.map((node) => {
+      const d = node.data as IssueNodeData;
+      const matchesSearch =
+        (d.identifier?.toLowerCase().includes(searchLower) ?? false) ||
+        d.title.toLowerCase().includes(searchLower);
+      return {
+        ...node,
+        data: { ...d, dimmed: !matchesSearch, searchMatch: matchesSearch },
+      };
+    });
+  }, [layoutedNodes, debouncedSearch]);
+
+  const flowEdges = layoutedEdges;
 
   // React Flow state
   const [nodes, setNodes, onNodesChange] = useNodesState(flowNodes);

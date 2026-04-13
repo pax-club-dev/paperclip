@@ -343,24 +343,14 @@ export function issueRoutes(
     const assigneeFilter = req.query.assigneeAgentId as string | undefined;
     const priorityFilter = req.query.priority as string | undefined;
 
-    // Fetch all issues for the company (normalize paginated response to array)
+    // Push filters to the database query instead of loading all issues then filtering in JS
     const listResult = await svc.list(companyId, {
       includeRoutineExecutions: false,
+      status: statusFilter,
+      assigneeAgentId: assigneeFilter,
+      priority: priorityFilter,
     });
-    let allIssues = Array.isArray(listResult) ? listResult : listResult.items;
-
-    // Apply optional filters for the graph view
-    if (statusFilter) {
-      const statuses = new Set(statusFilter.split(","));
-      allIssues = allIssues.filter((i: { status: string }) => statuses.has(i.status));
-    }
-    if (assigneeFilter) {
-      allIssues = allIssues.filter((i: { assigneeAgentId: string | null }) => i.assigneeAgentId === assigneeFilter);
-    }
-    if (priorityFilter) {
-      const priorities = new Set(priorityFilter.split(","));
-      allIssues = allIssues.filter((i: { priority: string | null }) => i.priority && priorities.has(i.priority));
-    }
+    const allIssues = Array.isArray(listResult) ? listResult : listResult.items;
 
     const issueIds = allIssues.map((i: { id: string }) => i.id);
     const issueIdSet = new Set(issueIds);
