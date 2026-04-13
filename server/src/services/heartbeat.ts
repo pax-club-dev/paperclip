@@ -1941,13 +1941,41 @@ export function heartbeatService(db: Db) {
     return queued;
   }
 
+  // ---------------------------------------------------------------------------
+  // Dispatch source metrics — PAX-2177
+  // ---------------------------------------------------------------------------
+  const dispatchMetrics = { eventSourced: 0, timerSourced: 0, lastReportedAt: Date.now() };
+  function trackDispatchSource(source: string) {
+    if (source === "timer") dispatchMetrics.timerSourced++;
+    else dispatchMetrics.eventSourced++;
+    const now = Date.now();
+    if (now - dispatchMetrics.lastReportedAt >= 30 * 60 * 1000) {
+      const total = dispatchMetrics.eventSourced + dispatchMetrics.timerSourced;
+      const pct = total > 0 ? Math.round((dispatchMetrics.eventSourced / total) * 100) : 0;
+      logger.info(
+        { eventSourced: dispatchMetrics.eventSourced, timerSourced: dispatchMetrics.timerSourced, eventDrivenPct: pct },
+        `dag_dispatch: ${dispatchMetrics.eventSourced} event-sourced, ${dispatchMetrics.timerSourced} timer-sourced (${pct}% event-driven)`,
+      );
+      dispatchMetrics.eventSourced = 0;
+      dispatchMetrics.timerSourced = 0;
+      dispatchMetrics.lastReportedAt = now;
+    }
+  }
+
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
     const heartbeat = parseObject(runtimeConfig.heartbeat);
 
+    const intervalSec = Math.max(0, asNumber(heartbeat.intervalSec, 0));
+    const fallbackIntervalSec = Math.max(
+      0,
+      asNumber(heartbeat.fallbackIntervalSec, intervalSec > 0 ? intervalSec * 3 : 0),
+    );
+
     return {
       enabled: asBoolean(heartbeat.enabled, true),
-      intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
+      intervalSec,
+      fallbackIntervalSec,
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
     };
@@ -2078,13 +2106,76 @@ export function heartbeatService(db: Db) {
     }
   }
 
-  // Returns true if the agent has at least one todo issue assigned to it with
-  // no execution lock and no unresolved blocker. Used to decide whether an
-  // idle agent should be immediately re-woken instead of waiting for its next
-  // timer tick.
-  async function autoWakeIdleAgentIfAssignableWork(agentId: string) {
-    const assignable = await db
-      .select({ id: issues.id })
+  // ---------------------------------------------------------------------------
+  // DAG-aware dispatch — PAX-2177
+  // ---------------------------------------------------------------------------
+
+  const PRIORITY_SCORES: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+  const DAG_TERMINAL_STATUSES = new Set(["done", "cancelled"]);
+
+  interface CompanyBlockingGraph {
+    blockerToBlocked: Map<string, string[]>;
+    fanOut: Map<string, number>;
+    criticalPathDepth: Map<string, number>;
+  }
+
+  async function computeCompanyBlockingGraph(companyId: string): Promise<CompanyBlockingGraph> {
+    const edges = await db
+      .select({ blockerId: issueRelations.issueId, blockedId: issueRelations.relatedIssueId })
+      .from(issueRelations)
+      .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.type, "blocks")));
+
+    const blockerToBlocked = new Map<string, string[]>();
+    if (edges.length === 0) return { blockerToBlocked, fanOut: new Map(), criticalPathDepth: new Map() };
+
+    const allIds = new Set<string>();
+    for (const e of edges) { allIds.add(e.blockerId); allIds.add(e.blockedId); }
+    const meta = await db.select({ id: issues.id, status: issues.status }).from(issues).where(inArray(issues.id, [...allIds]));
+    const statusMap = new Map(meta.map((i) => [i.id, i.status]));
+
+    for (const e of edges) {
+      if (DAG_TERMINAL_STATUSES.has(statusMap.get(e.blockerId) ?? "")) continue;
+      if (DAG_TERMINAL_STATUSES.has(statusMap.get(e.blockedId) ?? "")) continue;
+      const fwd = blockerToBlocked.get(e.blockerId) ?? [];
+      fwd.push(e.blockedId);
+      blockerToBlocked.set(e.blockerId, fwd);
+    }
+
+    const fanOut = new Map<string, number>();
+    for (const root of blockerToBlocked.keys()) {
+      const visited = new Set<string>();
+      const q = [...(blockerToBlocked.get(root) ?? [])];
+      while (q.length > 0) { const c = q.shift()!; if (visited.has(c)) continue; visited.add(c); q.push(...(blockerToBlocked.get(c) ?? [])); }
+      fanOut.set(root, visited.size);
+    }
+
+    const criticalPathDepth = new Map<string, number>();
+    function dfs(n: string, visiting: Set<string>): number {
+      if (criticalPathDepth.has(n)) return criticalPathDepth.get(n)!;
+      if (visiting.has(n)) return 0;
+      visiting.add(n);
+      let max = 0;
+      for (const c of blockerToBlocked.get(n) ?? []) max = Math.max(max, 1 + dfs(c, visiting));
+      visiting.delete(n);
+      criticalPathDepth.set(n, max);
+      return max;
+    }
+    for (const n of blockerToBlocked.keys()) if (!criticalPathDepth.has(n)) dfs(n, new Set());
+
+    return { blockerToBlocked, fanOut, criticalPathDepth };
+  }
+
+  interface RankedIssue { issueId: string; priority: string; priorityScore: number; fanOut: number; criticalPathDepth: number; createdAt: Date; }
+
+  async function rankReadyIssuesForAgent(agentId: string): Promise<RankedIssue[]> {
+    const agent = await getAgent(agentId);
+    if (!agent) return [];
+
+    // Find unblocked, unlocked todo issues with NO active heartbeat run already targeting them.
+    // The extra NOT EXISTS on heartbeat_runs prevents the runaway re-enqueue loop where
+    // a completed run releases the execution lock and the issue gets re-picked immediately.
+    const candidates = await db
+      .select({ id: issues.id, priority: issues.priority, companyId: issues.companyId, createdAt: issues.createdAt })
       .from(issues)
       .where(
         and(
@@ -2098,19 +2189,113 @@ export function heartbeatService(db: Db) {
               AND r.type = 'blocks'
               AND b.status NOT IN ('done', 'cancelled')
           )`,
+          sql`NOT EXISTS (
+            SELECT 1 FROM ${heartbeatRuns} hr
+            WHERE hr.agent_id = ${agentId}
+              AND hr.status IN ('queued', 'running')
+              AND hr.context_snapshot ->> 'issueId' = ${issues.id}
+          )`,
         ),
-      )
-      .limit(1);
+      );
 
-    if (assignable.length === 0) return;
+    if (candidates.length === 0) return [];
+    if (candidates.length === 1) {
+      const c = candidates[0];
+      return [{ issueId: c.id, priority: c.priority, priorityScore: PRIORITY_SCORES[c.priority] ?? 4, fanOut: 0, criticalPathDepth: 0, createdAt: new Date(c.createdAt) }];
+    }
 
-    await enqueueWakeup(agentId, {
-      source: "on_demand",
-      triggerDetail: "system",
-      reason: "idle_agent_has_assignable_work",
-      requestedByActorType: "system",
-      requestedByActorId: null,
+    const graph = await computeCompanyBlockingGraph(agent.companyId);
+    const ranked: RankedIssue[] = candidates.map((c) => ({
+      issueId: c.id, priority: c.priority, priorityScore: PRIORITY_SCORES[c.priority] ?? 4,
+      fanOut: graph.fanOut.get(c.id) ?? 0, criticalPathDepth: graph.criticalPathDepth.get(c.id) ?? 0,
+      createdAt: new Date(c.createdAt),
+    }));
+    ranked.sort((a, b) => {
+      if (a.priorityScore !== b.priorityScore) return a.priorityScore - b.priorityScore;
+      if (a.fanOut !== b.fanOut) return b.fanOut - a.fanOut;
+      if (a.criticalPathDepth !== b.criticalPathDepth) return b.criticalPathDepth - a.criticalPathDepth;
+      return a.createdAt.getTime() - b.createdAt.getTime();
     });
+    return ranked;
+  }
+
+  async function rankQueuedRunsByDagPriority(
+    queuedRuns: Array<typeof heartbeatRuns.$inferSelect>,
+  ): Promise<Array<typeof heartbeatRuns.$inferSelect>> {
+    if (queuedRuns.length <= 1) return queuedRuns;
+
+    const runIssueIds = new Map<string, string>();
+    const companyIds = new Set<string>();
+    for (const run of queuedRuns) {
+      const ctx = parseObject(run.contextSnapshot);
+      const iid = readNonEmptyString(ctx.issueId);
+      if (iid) runIssueIds.set(run.id, iid);
+      companyIds.add(run.companyId);
+    }
+    if (runIssueIds.size === 0) return queuedRuns;
+
+    const iids = [...new Set(runIssueIds.values())];
+    const meta = await db.select({ id: issues.id, priority: issues.priority, companyId: issues.companyId }).from(issues).where(inArray(issues.id, iids));
+    const issueById = new Map(meta.map((i) => [i.id, i]));
+
+    const graphs = new Map<string, CompanyBlockingGraph>();
+    for (const cid of companyIds) graphs.set(cid, await computeCompanyBlockingGraph(cid));
+
+    const scored = queuedRuns.map((run) => {
+      const iid = runIssueIds.get(run.id);
+      const issue = iid ? issueById.get(iid) : null;
+      const g = issue ? graphs.get(issue.companyId) : null;
+      return {
+        run,
+        ps: issue ? (PRIORITY_SCORES[issue.priority] ?? 4) : 5,
+        fo: g?.fanOut.get(iid!) ?? 0,
+        cp: g?.criticalPathDepth.get(iid!) ?? 0,
+        ca: run.createdAt ? new Date(run.createdAt).getTime() : Date.now(),
+      };
+    });
+    scored.sort((a, b) => (a.ps - b.ps) || (b.fo - a.fo) || (b.cp - a.cp) || (a.ca - b.ca));
+    return scored.map((s) => s.run);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Idle agent dispatch: when an agent becomes idle, find ALL unblocked ready
+  // issues using DAG ranking and enqueue wakeups in parallel (up to available
+  // slots). The NOT EXISTS check on heartbeat_runs prevents re-enqueuing issues
+  // that already have an active run, closing the runaway loop.  PAX-2177.
+  // ---------------------------------------------------------------------------
+  async function autoWakeIdleAgentIfAssignableWork(agentId: string) {
+    const ranked = await rankReadyIssuesForAgent(agentId);
+    if (ranked.length === 0) return;
+
+    const agent = await getAgent(agentId);
+    if (!agent) return;
+    const policy = parseHeartbeatPolicy(agent);
+    const runningCount = await countRunningRunsForAgent(agentId);
+    const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
+    if (availableSlots <= 0) return;
+
+    const toEnqueue = ranked.slice(0, availableSlots);
+    logger.info(
+      { agentId, enqueuing: toEnqueue.length, totalReady: ranked.length, availableSlots,
+        issues: toEnqueue.map((r) => ({ id: r.issueId, p: r.priority, fo: r.fanOut })) },
+      `dag_dispatch: idle agent waking for ${toEnqueue.length} issue(s)`,
+    );
+
+    for (const issue of toEnqueue) {
+      await enqueueWakeup(agentId, {
+        source: "on_demand",
+        triggerDetail: "system",
+        reason: "idle_agent_has_assignable_work",
+        payload: { issueId: issue.issueId },
+        contextSnapshot: {
+          issueId: issue.issueId,
+          source: "dag_dispatch",
+          dagRank: { priority: issue.priority, fanOut: issue.fanOut, criticalPathDepth: issue.criticalPathDepth },
+        },
+        requestedByActorType: "system",
+        requestedByActorId: "dag_dispatch",
+      });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -3930,13 +4115,18 @@ export function heartbeatService(db: Db) {
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
       if (availableSlots <= 0) return [];
 
-      const queuedRuns = await db
+      // PAX-2177: Load all queued runs, re-rank by DAG priority instead of FIFO.
+      let queuedRuns = await db
         .select()
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")))
-        .orderBy(asc(heartbeatRuns.createdAt))
-        .limit(availableSlots);
+        .orderBy(asc(heartbeatRuns.createdAt));
       if (queuedRuns.length === 0) return [];
+      if (queuedRuns.length > 1) {
+        try { queuedRuns = await rankQueuedRunsByDagPriority(queuedRuns); }
+        catch (err) { logger.warn({ err, agentId }, "dag_dispatch: rank failed, falling back to FIFO"); }
+      }
+      queuedRuns = queuedRuns.slice(0, availableSlots);
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of queuedRuns) {
@@ -5103,6 +5293,7 @@ export function heartbeatService(db: Db) {
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
     const source = opts.source ?? "on_demand";
+    trackDispatchSource(source);
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = { ...(opts.contextSnapshot ?? {}) };
     const reason = opts.reason ?? null;
@@ -5969,7 +6160,9 @@ export function heartbeatService(db: Db) {
         checked += 1;
         const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
         const elapsedMs = now.getTime() - baseline;
-        if (elapsedMs < policy.intervalSec * 1000) continue;
+        // PAX-2177: use fallbackIntervalSec (3x normal) — timers are now safety net
+        const timerIntervalSec = policy.fallbackIntervalSec > 0 ? policy.fallbackIntervalSec : policy.intervalSec;
+        if (elapsedMs < timerIntervalSec * 1000) continue;
 
         // Circuit breaker: if the last 3 succeeded runs were all no-ops
         // (< 10s duration, < 100 raw output tokens), back off the timer
