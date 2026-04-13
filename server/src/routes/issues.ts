@@ -372,11 +372,11 @@ export function issueRoutes(
 
     // Fetch agent names for display
     const agentIds = [...new Set(allIssues.map((i: { assigneeAgentId: string | null }) => i.assigneeAgentId).filter(Boolean))] as string[];
-    const agentMap = new Map<string, { name: string; icon: string | null }>();
+    const agentMap = new Map<string, { name: string; icon: string | null; status: string }>();
     if (agentIds.length > 0) {
       const agentsList = await agentsSvc.list(companyId);
       for (const a of agentsList) {
-        agentMap.set(a.id, { name: a.name, icon: a.icon });
+        agentMap.set(a.id, { name: a.name, icon: a.icon, status: a.status });
       }
     }
 
