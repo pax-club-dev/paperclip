@@ -192,7 +192,14 @@ export function hostPatchService(repoRoot?: string) {
       // Phase 4: Stage and commit
       logger.info({ targetDir, agent: opts.agentName }, "host-patch: committing");
       try {
-        await execFile("git", ["add", "-A"], { cwd: targetDir, timeout: 15_000 });
+        // Stage only the files touched by this patch (avoids bundling unrelated dirty-tree changes)
+        const affectedPaths = extractPatchedPaths(opts.patch);
+        if (affectedPaths.length > 0) {
+          await execFile("git", ["add", "--", ...affectedPaths], { cwd: targetDir, timeout: 15_000 });
+        } else {
+          // Fallback: if no paths parsed from the diff, stage everything
+          await execFile("git", ["add", "-A"], { cwd: targetDir, timeout: 15_000 });
+        }
 
         const attribution = opts.agentName
           ? `\n\nApplied-By: ${opts.agentName}${opts.agentId ? ` (${opts.agentId})` : ""}`
@@ -383,6 +390,20 @@ async function findAffectedTsconfigs(repoRoot: string, patch: string): Promise<s
   }
 
   return [...tsconfigs];
+}
+
+/**
+ * Extract file paths touched by a unified diff.
+ * Parses `--- a/path` and `+++ b/path` headers, deduplicates, returns relative paths.
+ */
+function extractPatchedPaths(patch: string): string[] {
+  const headerRe = /^[+-]{3} [ab]\/(.+)$/gm;
+  const paths = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = headerRe.exec(patch)) !== null) {
+    if (m[1] !== "/dev/null") paths.add(m[1]);
+  }
+  return [...paths];
 }
 
 /**
