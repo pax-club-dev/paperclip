@@ -40,6 +40,7 @@ const mockAgentService = vi.hoisted(() => ({
   getChainOfCommand: vi.fn(),
   resolveByReference: vi.fn(),
   resume: vi.fn(),
+  pause: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -177,6 +178,8 @@ describe("agent permission routes", () => {
     mockSecretService.resolveAdapterConfigForRuntime.mockImplementation(async (_companyId, config) => ({ config }));
     mockLogActivity.mockResolvedValue(undefined);
     mockAgentService.resume.mockResolvedValue({ ...baseAgent, status: "idle" });
+    mockAgentService.pause.mockResolvedValue({ ...baseAgent, status: "paused" });
+    mockHeartbeatService.cancelActiveForAgent = vi.fn().mockResolvedValue(undefined);
   });
 
   it("grants tasks:assign by default when board creates a new agent", async () => {
@@ -368,6 +371,28 @@ describe("agent permission routes", () => {
       const res = await request(app).post(`/api/agents/${agentId}/resume`).send({});
       expect(res.status).toBe(403);
       expect(mockAgentService.resume).not.toHaveBeenCalled();
+    });
+
+    it("lets a chain-of-command manager agent pause a subordinate", async () => {
+      mockAgentService.getById.mockImplementation(async (id: string) => {
+        if (id === agentId) return { ...baseAgent, status: "idle" };
+        if (id === managerId) return { ...baseAgent, id: managerId, role: "coo" };
+        return null;
+      });
+      mockAgentService.getChainOfCommand.mockResolvedValue([
+        { id: managerId, role: "coo" },
+      ]);
+
+      const app = createApp({
+        type: "agent",
+        agentId: managerId,
+        companyId,
+        source: "agent_key",
+      });
+
+      const res = await request(app).post(`/api/agents/${agentId}/pause`).send({});
+      expect(res.status).toBe(200);
+      expect(mockAgentService.pause).toHaveBeenCalledWith(agentId);
     });
 
     it("still allows the board to resume any agent", async () => {
