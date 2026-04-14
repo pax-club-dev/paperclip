@@ -29,7 +29,7 @@ import type { Issue } from "@paperclipai/shared";
 
 /* ── Helpers ── */
 
-const statusOrder = ["in_progress", "todo", "backlog", "in_review", "blocked", "done", "cancelled"];
+const statusOrder = ["in_progress", "todo", "backlog", "in_review", "done", "cancelled"];
 const priorityOrder = ["critical", "high", "medium", "low"];
 
 function statusLabel(status: string): string {
@@ -68,7 +68,7 @@ const defaultViewState: IssueViewState = {
 
 const quickFilterPresets = [
   { label: "All", statuses: [] as string[] },
-  { label: "Active", statuses: ["todo", "in_progress", "in_review", "blocked"] },
+  { label: "Active", statuses: ["todo", "in_progress", "in_review"] },
   { label: "Backlog", statuses: ["backlog"] },
   { label: "Done", statuses: ["done", "cancelled"] },
 ];
@@ -758,6 +758,14 @@ export function IssuesList({
                             <span className="shrink-0 font-mono text-xs text-muted-foreground">
                               {issue.identifier ?? issue.id.slice(0, 8)}
                             </span>
+                            {issue.isBlocked && (
+                              <span
+                                title="Blocked by one or more open issues"
+                                className="inline-flex shrink-0 items-center rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-red-700 bg-red-100 dark:text-red-200 dark:bg-red-900/40"
+                              >
+                                🔒 Blocked
+                              </span>
+                            )}
                             {liveIssueIds?.has(issue.id) && (
                               <span className="inline-flex items-center gap-1 rounded-full bg-blue-500/10 px-1.5 py-0.5 sm:gap-1.5 sm:px-2">
                                 <span className="relative flex h-2 w-2">

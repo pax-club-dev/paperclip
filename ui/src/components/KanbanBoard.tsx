@@ -27,7 +27,6 @@ const boardStatuses = [
   "todo",
   "in_progress",
   "in_review",
-  "blocked",
   "done",
   "cancelled",
 ];
@@ -168,6 +167,14 @@ function KanbanCard({
         <p className="text-sm leading-snug line-clamp-2 mb-2">{issue.title}</p>
         <div className="flex items-center gap-2">
           <PriorityIcon priority={issue.priority} />
+          {issue.isBlocked && (
+            <span
+              title="Blocked by one or more open issues"
+              className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-red-700 bg-red-100 dark:text-red-200 dark:bg-red-900/40"
+            >
+              🔒 Blocked
+            </span>
+          )}
           {issue.assigneeAgentId && (() => {
             const name = agentName(issue.assigneeAgentId);
             return name ? (

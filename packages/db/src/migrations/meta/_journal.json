@@ -358,6 +358,13 @@
       "when": 1775865600000,
       "tag": "0050_eta_field",
       "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "7",
+      "when": 1776297600000,
+      "tag": "0051_drop_blocked_status",
+      "breakpoints": true
     }
   ]
 }

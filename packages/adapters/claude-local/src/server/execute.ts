@@ -307,6 +307,7 @@ export async function runClaudeLogin(input: {
     timeoutSec: runtime.timeoutSec,
     graceSec: runtime.graceSec,
     onLog,
+    adapterType: "claude_local",
   });
 
   const loginMeta = detectClaudeLoginRequired({
@@ -513,6 +514,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onSpawn,
       onLog,
       sandbox,
+      adapterType: "claude_local",
     });
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);

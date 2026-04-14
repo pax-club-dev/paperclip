@@ -7,7 +7,10 @@ export interface ActivityFilters {
   agentId?: string;
   entityType?: string;
   entityId?: string;
+  limit?: number;
 }
+
+const MAX_ACTIVITY_LIST_LIMIT = 500;
 
 export function activityService(db: Db) {
   const issueIdAsText = sql<string>`${issues.id}::text`;
@@ -25,7 +28,7 @@ export function activityService(db: Db) {
         conditions.push(eq(activityLog.entityId, filters.entityId));
       }
 
-      return db
+      const query = db
         .select({ activityLog })
         .from(activityLog)
         .leftJoin(
@@ -44,8 +47,14 @@ export function activityService(db: Db) {
             ),
           ),
         )
-        .orderBy(desc(activityLog.createdAt))
-        .then((rows) => rows.map((r) => r.activityLog));
+        .orderBy(desc(activityLog.createdAt));
+
+      const limited =
+        filters.limit && filters.limit > 0
+          ? query.limit(Math.min(Math.floor(filters.limit), MAX_ACTIVITY_LIST_LIMIT))
+          : query;
+
+      return limited.then((rows) => rows.map((r) => r.activityLog));
     },
 
     forIssue: (issueId: string) =>

@@ -154,7 +154,7 @@ describe("closed isolated workspace issue routes", () => {
       .post(`/api/issues/${issueId}/checkout`)
       .send({
         agentId,
-        expectedStatuses: ["todo", "backlog", "blocked"],
+        expectedStatuses: ["todo", "backlog"],
       });
 
     expect(res.status).toBe(409);

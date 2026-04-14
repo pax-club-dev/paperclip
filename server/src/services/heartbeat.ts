@@ -68,7 +68,7 @@ import { quotaHealthService } from "./quota-health.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
-const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
+const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 3;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
@@ -2025,8 +2025,42 @@ export function heartbeatService(db: Db) {
     }
 
     const context = parseObject(run.contextSnapshot);
+    const contextIssueId = readNonEmptyString(context.issueId);
+    if (contextIssueId) {
+      const [targetIssue] = await db
+        .select({ status: issues.status, identifier: issues.identifier })
+        .from(issues)
+        .where(eq(issues.id, contextIssueId));
+      if (targetIssue && (targetIssue.status === "done" || targetIssue.status === "cancelled")) {
+        // Inlined cancel: we're inside withAgentStartLock(run.agentId); cancelRunInternal
+        // re-enters that lock via startNextQueuedRunForAgent and would deadlock. The caller
+        // loop in startNextQueuedRunForAgent continues iterating queued runs for this agent.
+        const reason = `Target issue ${targetIssue.identifier ?? contextIssueId} is already ${targetIssue.status}; skipping run`;
+        const finishedAt = new Date();
+        const cancelled = await setRunStatus(run.id, "cancelled", {
+          finishedAt,
+          error: reason,
+          errorCode: "cancelled",
+        });
+        await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+          finishedAt,
+          error: reason,
+        });
+        if (cancelled) {
+          await appendRunEvent(cancelled, 1, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "run cancelled",
+          });
+          await releaseIssueExecutionAndPromote(cancelled);
+        }
+        return null;
+      }
+    }
+
     const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
-      issueId: readNonEmptyString(context.issueId),
+      issueId: contextIssueId,
       projectId: readNonEmptyString(context.projectId),
     });
     if (budgetBlock) {
@@ -2505,7 +2539,9 @@ export function heartbeatService(db: Db) {
 
     if (stuck.length === 0) return { filed: 0, skipped: 0 };
 
+    const PER_AGENT_OPEN_WATCHDOG_CAP = 3;
     const originIds = stuck.map((s) => `run:${s.runId}`);
+    const stuckAgentIds = [...new Set(stuck.map((s) => s.agentId))];
     const existing = await db
       .select({ originId: issues.originId })
       .from(issues)
@@ -2517,6 +2553,32 @@ export function heartbeatService(db: Db) {
         ),
       );
     const alreadyAlerted = new Set(existing.map((e) => e.originId));
+
+    // Per-agent cap: count all open watchdog issues for these agents (not just the
+    // stuck-run subset) so a backlog of N stuck runs on one agent doesn't file N
+    // new issues each sweep.
+    const openWatchdogPerAgent = await db
+      .select({
+        agentId: heartbeatRuns.agentId,
+        count: sql<number>`count(*)::int`.as("count"),
+      })
+      .from(issues)
+      .innerJoin(
+        heartbeatRuns,
+        sql`'run:' || ${heartbeatRuns.id}::text = ${issues.originId}`,
+      )
+      .where(
+        and(
+          eq(issues.originKind, "watchdog"),
+          sql`${issues.status} NOT IN ('done', 'cancelled')`,
+          inArray(heartbeatRuns.agentId, stuckAgentIds),
+        ),
+      )
+      .groupBy(heartbeatRuns.agentId);
+    const openCountByAgent = new Map<string, number>(
+      openWatchdogPerAgent.map((row) => [row.agentId, Number(row.count)]),
+    );
+    const cappedAgents = new Set<string>();
 
     const cooByCompany = new Map<string, string>();
     async function findCoo(companyId: string): Promise<string | null> {
@@ -2541,12 +2603,18 @@ export function heartbeatService(db: Db) {
 
     let filed = 0;
     let skipped = 0;
+    let cappedSkips = 0;
     const issueSvc = issueService(db);
     // Track which COOs need a single wake after filing all alerts
     const coosToWake = new Map<string, { companyId: string; issueIds: string[] }>();
     for (const s of stuck) {
       if (alreadyAlerted.has(`run:${s.runId}`)) {
         skipped += 1;
+        continue;
+      }
+      if ((openCountByAgent.get(s.agentId) ?? 0) >= PER_AGENT_OPEN_WATCHDOG_CAP) {
+        cappedSkips += 1;
+        cappedAgents.add(s.agentId);
         continue;
       }
       const cooId = await findCoo(s.companyId);
@@ -2593,6 +2661,7 @@ export function heartbeatService(db: Db) {
           originId: `run:${s.runId}`,
         });
         filed += 1;
+        openCountByAgent.set(s.agentId, (openCountByAgent.get(s.agentId) ?? 0) + 1);
         logger.warn(
           {
             runId: s.runId,
@@ -2636,13 +2705,20 @@ export function heartbeatService(db: Db) {
       });
     }
 
-    if (filed > 0) {
+    if (filed > 0 || cappedSkips > 0) {
       logger.warn(
-        { filed, skipped, stuckCount: stuck.length },
+        {
+          filed,
+          skipped,
+          cappedSkips,
+          cappedAgentIds: [...cappedAgents],
+          stuckCount: stuck.length,
+          perAgentCap: PER_AGENT_OPEN_WATCHDOG_CAP,
+        },
         "watchdog: stuck-run sweep filed new COO alerts",
       );
     }
-    return { filed, skipped };
+    return { filed, skipped: skipped + cappedSkips };
   }
 
   // ---------------------------------------------------------------------------
@@ -2653,7 +2729,7 @@ export function heartbeatService(db: Db) {
   // actionable), escalates their priority, and files COO alerts so the
   // orchestrator knows where to focus.  Also detects circular blocking.
   // ---------------------------------------------------------------------------
-  const OPEN_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
+  const OPEN_STATUSES = ["backlog", "todo", "in_progress", "in_review"];
   const TERMINAL_STATUSES = new Set(["done", "cancelled"]);
   const ROOT_BLOCKER_MIN_FANOUT = 2;
 
@@ -3387,7 +3463,7 @@ export function heartbeatService(db: Db) {
         and(
           eq(issues.originKind, "routine_execution"),
           sql`${issues.originId} IS NOT NULL`,
-          inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+          inArray(issues.status, ["backlog", "todo", "in_progress", "in_review"]),
         ),
       )
       .groupBy(issues.originId)
@@ -3408,7 +3484,7 @@ export function heartbeatService(db: Db) {
           and(
             eq(issues.originKind, "routine_execution"),
             eq(issues.originId, originId),
-            inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+            inArray(issues.status, ["backlog", "todo", "in_progress", "in_review"]),
           ),
         )
         .orderBy(desc(issues.updatedAt))
@@ -3512,7 +3588,7 @@ export function heartbeatService(db: Db) {
         .where(
           and(
             eq(issues.assigneeAgentId, coo.id),
-            inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+            inArray(issues.status, ["backlog", "todo", "in_progress", "in_review"]),
             isNull(issues.hiddenAt),
           ),
         )
@@ -5980,6 +6056,41 @@ export function heartbeatService(db: Db) {
     return cancelled;
   }
 
+  async function cancelQueuedRunsForIssueInternal(
+    issueId: string,
+    reason = "Target issue is no longer actionable",
+  ): Promise<{ cancelledCount: number; runIds: string[] }> {
+    if (!issueId) return { cancelledCount: 0, runIds: [] };
+    const queued = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.status, "queued"),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      );
+    const cancelledIds: string[] = [];
+    for (const { id } of queued) {
+      try {
+        const cancelled = await cancelRunInternal(id, reason);
+        if (cancelled?.status === "cancelled") cancelledIds.push(id);
+      } catch (err) {
+        logger.warn(
+          { err, runId: id, issueId },
+          "failed to cancel queued run for terminal issue",
+        );
+      }
+    }
+    if (cancelledIds.length > 0) {
+      logger.info(
+        { issueId, cancelledCount: cancelledIds.length, runIds: cancelledIds },
+        "cancelled queued heartbeat runs because target issue became terminal",
+      );
+    }
+    return { cancelledCount: cancelledIds.length, runIds: cancelledIds };
+  }
+
   async function cancelActiveForAgentInternal(agentId: string, reason = "Cancelled due to agent pause") {
     const runs = await db
       .select()
@@ -6285,6 +6396,9 @@ export function heartbeatService(db: Db) {
     },
 
     cancelRun: (runId: string) => cancelRunInternal(runId),
+
+    cancelQueuedRunsForIssue: (issueId: string, reason?: string) =>
+      cancelQueuedRunsForIssueInternal(issueId, reason),
 
     cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),
 

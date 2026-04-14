@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
+  deriveIsBlocked,
   createIssueAttachmentMetadataSchema,
   createIssueWorkProductSchema,
   createIssueLabelSchema,
@@ -579,6 +580,7 @@ export function issueRoutes(
       ancestors,
       blockedBy: relations.blockedBy,
       blocks: relations.blocks,
+      isBlocked: deriveIsBlocked(relations.blockedBy),
       ...documentPayload,
       project: project ?? null,
       goal: goal ?? null,
@@ -625,6 +627,7 @@ export function issueRoutes(
         parentId: issue.parentId,
         blockedBy: relations.blockedBy,
         blocks: relations.blocks,
+        isBlocked: deriveIsBlocked(relations.blockedBy),
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
         updatedAt: issue.updatedAt,
@@ -1347,6 +1350,22 @@ export function issueRoutes(
       };
     }
     await routinesSvc.syncRunStatusForIssue(issue.id);
+
+    const existingWasTerminal = existing.status === "done" || existing.status === "cancelled";
+    const issueBecameTerminal = issue.status === "done" || issue.status === "cancelled";
+    if (!existingWasTerminal && issueBecameTerminal) {
+      try {
+        await heartbeat.cancelQueuedRunsForIssue(
+          issue.id,
+          `Issue ${issue.identifier ?? issue.id} transitioned to ${issue.status}`,
+        );
+      } catch (err) {
+        logger.warn(
+          { err, issueId: issue.id, status: issue.status },
+          "failed to cancel queued runs after terminal status transition",
+        );
+      }
+    }
 
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>

@@ -4,6 +4,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { issueRoutes } from "../routes/issues.js";
 
 const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
+const mockCancelQueuedRunsForIssue = vi.hoisted(() =>
+  vi.fn(async () => ({ cancelledCount: 0, runIds: [] as string[] })),
+);
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
   getById: vi.fn(),
@@ -39,6 +42,7 @@ vi.mock("../services/index.js", () => ({
   heartbeatService: () => ({
     wakeup: mockWakeup,
     reportRunActivity: vi.fn(async () => undefined),
+    cancelQueuedRunsForIssue: mockCancelQueuedRunsForIssue,
   }),
   instanceSettingsService: () => ({
     get: vi.fn(),
@@ -101,7 +105,7 @@ describe("issue dependency wakeups in issue routes", () => {
       identifier: "PAP-100",
       title: "Finish blocker",
       description: null,
-      status: "blocked",
+      status: "todo",
       priority: "medium",
       parentId: null,
       assigneeAgentId: "agent-1",
@@ -208,5 +212,183 @@ describe("issue dependency wakeups in issue routes", () => {
         }),
       }),
     );
+  });
+
+  it("cancels queued runs for the issue when status transitions to cancelled", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: "issue-x",
+      companyId: "company-1",
+      identifier: "PAP-200",
+      title: "Abandoned task",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+    mockIssueService.update.mockResolvedValue({
+      id: "issue-x",
+      companyId: "company-1",
+      identifier: "PAP-200",
+      title: "Abandoned task",
+      description: null,
+      status: "cancelled",
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+
+    const res = await request(createApp()).patch("/api/issues/issue-x").send({ status: "cancelled" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(res.status).toBe(200);
+    expect(mockCancelQueuedRunsForIssue).toHaveBeenCalledWith(
+      "issue-x",
+      expect.stringContaining("cancelled"),
+    );
+  });
+
+  it("cancels queued runs for the issue when status transitions to done", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: "issue-y",
+      companyId: "company-1",
+      identifier: "PAP-201",
+      title: "Completed task",
+      description: null,
+      status: "in_progress",
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+    mockIssueService.update.mockResolvedValue({
+      id: "issue-y",
+      companyId: "company-1",
+      identifier: "PAP-201",
+      title: "Completed task",
+      description: null,
+      status: "done",
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+
+    const res = await request(createApp()).patch("/api/issues/issue-y").send({ status: "done" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(res.status).toBe(200);
+    expect(mockCancelQueuedRunsForIssue).toHaveBeenCalledWith(
+      "issue-y",
+      expect.stringContaining("done"),
+    );
+  });
+
+  it("does NOT cancel queued runs when issue was already terminal", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: "issue-z",
+      companyId: "company-1",
+      identifier: "PAP-202",
+      title: "Already done",
+      description: null,
+      status: "done",
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+    mockIssueService.update.mockResolvedValue({
+      id: "issue-z",
+      companyId: "company-1",
+      identifier: "PAP-202",
+      title: "Already done",
+      description: null,
+      status: "done",
+      priority: "high",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+
+    const res = await request(createApp()).patch("/api/issues/issue-z").send({ priority: "high" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(res.status).toBe(200);
+    expect(mockCancelQueuedRunsForIssue).not.toHaveBeenCalled();
+  });
+
+  it("does NOT cancel queued runs when status stays open (todo → in_progress)", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: "issue-w",
+      companyId: "company-1",
+      identifier: "PAP-203",
+      title: "Still in progress",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+    mockIssueService.update.mockResolvedValue({
+      id: "issue-w",
+      companyId: "company-1",
+      identifier: "PAP-203",
+      title: "Still in progress",
+      description: null,
+      status: "in_progress",
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+
+    const res = await request(createApp()).patch("/api/issues/issue-w").send({ status: "in_progress" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(res.status).toBe(200);
+    expect(mockCancelQueuedRunsForIssue).not.toHaveBeenCalled();
   });
 });

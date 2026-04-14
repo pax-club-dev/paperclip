@@ -58,15 +58,16 @@ export function Dashboard() {
 
   const { data: activity } = useQuery({
     queryKey: queryKeys.activity(selectedCompanyId!),
-    queryFn: () => activityApi.list(selectedCompanyId!),
+    queryFn: () => activityApi.list(selectedCompanyId!, { limit: 50 }),
     enabled: !!selectedCompanyId,
   });
 
-  const { data: issues } = useQuery({
-    queryKey: queryKeys.issues.list(selectedCompanyId!),
-    queryFn: () => issuesApi.list(selectedCompanyId!),
+  const { data: issuesPage } = useQuery({
+    queryKey: [...queryKeys.issues.list(selectedCompanyId!), { limit: 100 }],
+    queryFn: () => issuesApi.listPaginated(selectedCompanyId!, { limit: 100 }),
     enabled: !!selectedCompanyId,
   });
+  const issues = issuesPage?.items;
 
   const { data: projects } = useQuery({
     queryKey: queryKeys.projects.list(selectedCompanyId!),

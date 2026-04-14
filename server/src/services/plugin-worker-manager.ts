@@ -616,9 +616,18 @@ export function createPluginWorkerHandle(
       TZ: process.env.TZ ?? "UTC",
     };
 
+    const callerExecArgv = options.execArgv ?? [];
+    const hasHeapFlag = callerExecArgv.some((arg) => arg.startsWith("--max-old-space-size"));
+    const defaultHeapMb = Number.parseInt(process.env.PAPERCLIP_PLUGIN_HEAP_MB ?? "512", 10);
+    const heapCapDisabled = process.env.PAPERCLIP_DISABLE_MEMORY_CAPS === "1";
+    const execArgv =
+      hasHeapFlag || heapCapDisabled || !Number.isFinite(defaultHeapMb) || defaultHeapMb <= 0
+        ? callerExecArgv
+        : [`--max-old-space-size=${defaultHeapMb}`, ...callerExecArgv];
+
     const child = fork(options.entrypointPath, [], {
       stdio: ["pipe", "pipe", "pipe", "ipc"],
-      execArgv: options.execArgv ?? [],
+      execArgv,
       env: workerEnv,
       // Don't let the child keep the parent alive
       detached: false,

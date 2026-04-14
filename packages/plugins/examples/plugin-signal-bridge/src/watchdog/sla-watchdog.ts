@@ -17,6 +17,7 @@ import { createReadStream, existsSync, watchFile, unwatchFile } from "node:fs";
 import { stat, appendFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { request as httpRequest } from "node:http";
+import { URLSearchParams } from "node:url";
 import { BREACH_LOG_FILE_PATH } from "../constants.js";
 
 // ---------------------------------------------------------------------------
@@ -121,7 +122,71 @@ function apiRequest(
   });
 }
 
+const OPEN_STATUSES = ["backlog", "todo", "in_progress", "in_review"];
+
+async function findOpenWatchdogIssueForSender(
+  sender: string,
+): Promise<{ id: string; identifier?: string } | null> {
+  const originId = `sla_breach:sender:${sender}`;
+  try {
+    const qs = new URLSearchParams({
+      originKind: "sla_breach_watchdog",
+      originId,
+      status: OPEN_STATUSES.join(","),
+    });
+    const result = (await apiRequest(
+      "GET",
+      `/api/companies/${COMPANY_ID}/issues?${qs.toString()}`,
+    )) as Record<string, unknown>;
+    const items = Array.isArray(result["items"])
+      ? (result["items"] as Array<Record<string, unknown>>)
+      : Array.isArray((result as unknown as { data?: unknown[] }).data)
+        ? ((result as unknown as { data: Array<Record<string, unknown>> }).data)
+        : [];
+    if (items.length === 0) return null;
+    const first = items[0];
+    const id = typeof first["id"] === "string" ? first["id"] : null;
+    if (!id) return null;
+    return {
+      id,
+      identifier: typeof first["identifier"] === "string" ? first["identifier"] : undefined,
+    };
+  } catch (err) {
+    console.error("[watchdog] Failed to query existing breach issues:", err);
+    return null;
+  }
+}
+
+async function appendBreachComment(
+  issueId: string,
+  entry: BreachLogEntry,
+): Promise<void> {
+  const body = {
+    body:
+      `Additional SLA breach from ${maskSender(entry.sender)} ` +
+      `(message \`${entry.messageId}\`, detected at ${new Date(entry.breachDetectedAt).toISOString()}). ` +
+      `Latency: ${entry.latencyMs != null ? `${entry.latencyMs}ms` : "no response"}.`,
+  };
+  try {
+    await apiRequest("POST", `/api/issues/${issueId}/comments`, body);
+  } catch (err) {
+    console.error(
+      `[watchdog] Failed to append comment on ${issueId}:`,
+      err,
+    );
+  }
+}
+
 async function createPostmortemIssue(entry: BreachLogEntry): Promise<void> {
+  const existing = await findOpenWatchdogIssueForSender(entry.sender);
+  if (existing) {
+    console.log(
+      `[watchdog] Open breach issue ${existing.identifier ?? existing.id} already exists for ${maskSender(entry.sender)}; appending comment.`,
+    );
+    await appendBreachComment(existing.id, entry);
+    return;
+  }
+
   const title = `[Watchdog] SLA Breach: ${maskSender(entry.sender)} message unanswered >20s`;
   const description =
     `## SLA Breach — Watchdog Auto-Postmortem\n\n` +
@@ -147,6 +212,8 @@ async function createPostmortemIssue(entry: BreachLogEntry): Promise<void> {
     description,
     status: "todo",
     priority: "critical",
+    originKind: "sla_breach_watchdog",
+    originId: `sla_breach:sender:${entry.sender}`,
   };
   if (CTO_AGENT_ID) {
     body["assigneeAgentId"] = CTO_AGENT_ID;

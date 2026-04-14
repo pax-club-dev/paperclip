@@ -1,10 +1,12 @@
 // Re-export everything from the shared adapter-utils/server-utils package.
 // This file is kept as a convenience shim so existing in-tree
 // imports (process/, http/, heartbeat.ts) don't need rewriting.
-import type { ChildProcess } from "node:child_process";
 import { logger } from "../middleware/logger.js";
 import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
-export type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
+export type {
+  RunProcessResult,
+  RunningProcess,
+} from "@paperclipai/adapter-utils/server-utils";
 
 type BuildInvocationEnvForLogsOptions = {
   runtimeEnv?: NodeJS.ProcessEnv | Record<string, string>;
@@ -13,8 +15,7 @@ type BuildInvocationEnvForLogsOptions = {
   resolvedCommandEnvKey?: string;
 };
 
-export const runningProcesses: Map<string, { child: ChildProcess; graceSec: number }> =
-  serverUtils.runningProcesses;
+export const runningProcesses = serverUtils.runningProcesses;
 export const MAX_CAPTURE_BYTES = serverUtils.MAX_CAPTURE_BYTES;
 export const MAX_EXCERPT_BYTES = serverUtils.MAX_EXCERPT_BYTES;
 export const parseObject = serverUtils.parseObject;
@@ -72,19 +73,14 @@ export function buildInvocationEnvForLogs(
 
 // Re-export runChildProcess with the server's pino logger wired in.
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
+type RunChildProcessOpts = Parameters<typeof serverUtils.runChildProcess>[3];
 const _runChildProcess = serverUtils.runChildProcess;
 
 export async function runChildProcess(
   runId: string,
   command: string,
   args: string[],
-  opts: {
-    cwd: string;
-    env: Record<string, string>;
-    timeoutSec: number;
-    graceSec: number;
-    onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
-  },
+  opts: RunChildProcessOpts,
 ): Promise<RunProcessResult> {
   return _runChildProcess(runId, command, args, {
     ...opts,

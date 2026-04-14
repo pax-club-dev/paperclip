@@ -182,6 +182,7 @@ export async function testEnvironment(
           graceSec: 5,
           stdin: "Respond with hello.",
           onLog: async () => {},
+          adapterType: "claude_local",
         },
       );
 

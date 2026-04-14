@@ -155,6 +155,12 @@ export interface Issue {
   labels?: IssueLabel[];
   blockedBy?: IssueRelationIssueSummary[];
   blocks?: IssueRelationIssueSummary[];
+  /**
+   * Derived: true if this issue has one or more open (non-terminal) blockers.
+   * Replaces the former `status: "blocked"` state — an issue's work phase
+   * (todo/in_progress/etc.) is now orthogonal to its blocked-ness.
+   */
+  isBlocked?: boolean;
   planDocument?: IssueDocument | null;
   documentSummaries?: IssueDocumentSummary[];
   legacyPlanDocument?: LegacyPlanDocument | null;
@@ -169,6 +175,25 @@ export interface Issue {
   isUnreadForMe?: boolean;
   createdAt: Date;
   updatedAt: Date;
+}
+
+/**
+ * A blocker is "resolving" (no longer holding back the blocked issue) when it
+ * reaches a terminal status. Everything else is an open blocker.
+ */
+export function isBlockerResolved(blockerStatus: string): boolean {
+  return blockerStatus === "done" || blockerStatus === "cancelled";
+}
+
+/**
+ * Derive isBlocked from an issue's blockedBy relations. Returns true iff at
+ * least one blocker is still open (not done/cancelled).
+ */
+export function deriveIsBlocked(
+  blockedBy: Pick<IssueRelationIssueSummary, "status">[] | undefined | null,
+): boolean {
+  if (!blockedBy || blockedBy.length === 0) return false;
+  return blockedBy.some((b) => !isBlockerResolved(b.status));
 }
 
 export interface IssueComment {

@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -6,6 +6,74 @@ import { promisify } from "node:util";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
 
 const execFileAsync = promisify(execFile);
+
+// Spawn the quota probe in its own process group so we can reliably tear down
+// the full `sh -c '... | script -qefc claude ...'` tree on any exit path.
+// Plain execFile(..., { timeout }) only SIGTERMs the direct child (sh); the
+// `script` pty wrapper and the `claude` CLI beneath it get reparented to PID 1
+// and leak ~350 MB each. With enough heartbeat ticks the host OOMs.
+interface ProbeResult {
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}
+
+function runProbeInOwnProcessGroup(
+  command: string,
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+  maxBuffer: number,
+): Promise<ProbeResult> {
+  return new Promise((resolve) => {
+    const child = spawn("sh", ["-c", command], {
+      env,
+      detached: true, // new process group — child.pid is the pgid
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let stdoutLen = 0;
+    let stderrLen = 0;
+    let settled = false;
+    let timedOut = false;
+
+    const killGroup = () => {
+      if (!child.pid) return;
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        /* process group already gone */
+      }
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killGroup();
+    }, timeoutMs);
+
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      killGroup(); // belt-and-braces: kill the whole group even on clean exit
+      resolve({ stdout, stderr, timedOut });
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (stdoutLen >= maxBuffer) return;
+      stdoutLen += chunk.length;
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stderrLen >= maxBuffer) return;
+      stderrLen += chunk.length;
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", () => settle());
+    child.on("close", () => settle());
+  });
+}
 
 const CLAUDE_USAGE_SOURCE_OAUTH = "anthropic-oauth";
 const CLAUDE_USAGE_SOURCE_CLI = "claude-cli";
@@ -437,33 +505,19 @@ function buildClaudeCliShellProbeCommand(): string {
 
 export async function captureClaudeCliUsageText(timeoutMs = 12_000): Promise<string> {
   const command = buildClaudeCliShellProbeCommand();
-  try {
-    const { stdout, stderr } = await execFileAsync("sh", ["-c", command], {
-      env: createClaudeQuotaEnv(),
-      timeout: timeoutMs,
-      maxBuffer: 8 * 1024 * 1024,
-    });
-    const output = `${stdout}${stderr}`;
-    const cleaned = cleanTerminalText(output);
-    if (usageOutputLooksComplete(cleaned)) return output;
+  const { stdout, stderr, timedOut } = await runProbeInOwnProcessGroup(
+    command,
+    createClaudeQuotaEnv(),
+    timeoutMs,
+    8 * 1024 * 1024,
+  );
+  const output = `${stdout}${stderr}`;
+  const cleaned = cleanTerminalText(output);
+  if (usageOutputLooksComplete(cleaned)) return output;
+  if (timedOut || usageOutputLooksRelevant(cleaned)) {
     throw new Error("Claude CLI usage probe ended before rendering usage.");
-  } catch (error) {
-    const stdout =
-      typeof error === "object" && error !== null && "stdout" in error && typeof error.stdout === "string"
-        ? error.stdout
-        : "";
-    const stderr =
-      typeof error === "object" && error !== null && "stderr" in error && typeof error.stderr === "string"
-        ? error.stderr
-        : "";
-    const output = `${stdout}${stderr}`;
-    const cleaned = cleanTerminalText(output);
-    if (usageOutputLooksComplete(cleaned)) return output;
-    if (usageOutputLooksRelevant(cleaned)) {
-      throw new Error("Claude CLI usage probe ended before rendering usage.");
-    }
-    throw error instanceof Error ? error : new Error(String(error));
   }
+  throw new Error("Claude CLI usage probe produced no usable output.");
 }
 
 export async function fetchClaudeCliQuota(): Promise<QuotaWindow[]> {

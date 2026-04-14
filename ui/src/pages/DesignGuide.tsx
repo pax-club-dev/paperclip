@@ -398,7 +398,7 @@ export function DesignGuide() {
             {[
               "active", "running", "paused", "idle", "archived", "planned",
               "achieved", "completed", "failed", "timed_out", "succeeded", "error",
-              "pending_approval", "backlog", "todo", "in_progress", "in_review", "blocked",
+              "pending_approval", "backlog", "todo", "in_progress", "in_review",
               "done", "terminated", "cancelled", "pending", "revision_requested",
               "approved", "rejected",
             ].map((s) => (
@@ -409,7 +409,7 @@ export function DesignGuide() {
 
         <SubSection title="StatusIcon (interactive)">
           <div className="flex items-center gap-3 flex-wrap">
-            {["backlog", "todo", "in_progress", "in_review", "done", "cancelled", "blocked"].map(
+            {["backlog", "todo", "in_progress", "in_review", "done", "cancelled"].map(
               (s) => (
                 <div key={s} className="flex items-center gap-1.5">
                   <StatusIcon status={s} />
@@ -869,14 +869,14 @@ export function DesignGuide() {
           <EntityRow
             leading={
               <>
-                <StatusIcon status="blocked" />
+                <StatusIcon status="todo" />
                 <PriorityIcon priority="critical" />
               </>
             }
             identifier="PAP-004"
             title="Deploy to production"
             subtitle="Blocked by PAP-001"
-            trailing={<StatusBadge status="blocked" />}
+            trailing={<StatusBadge status="todo" />}
             selected
           />
         </div>

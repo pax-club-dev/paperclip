@@ -177,6 +177,7 @@ export async function testEnvironment(
           graceSec: 5,
           stdin: "Respond with hello.",
           onLog: async () => {},
+          adapterType: "codex_local",
         },
       );
       const parsed = parseCodexJsonl(probe.stdout);

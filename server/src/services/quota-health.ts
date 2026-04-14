@@ -1,6 +1,6 @@
-import { and, eq, inArray, ne } from "drizzle-orm";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents } from "@paperclipai/db";
+import { agents, issues } from "@paperclipai/db";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
@@ -183,11 +183,51 @@ export async function createQuotaAlertIssue(
     triggerAgentId?: string | null;
   },
 ): Promise<string | null> {
+  const originKind = "quota_alert";
+  const originId = `${opts.provider.toLowerCase()}:${opts.level}`;
+
+  const existing = await db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, opts.companyId),
+        eq(issues.originKind, originKind),
+        eq(issues.originId, originId),
+        sql`${issues.status} NOT IN ('done', 'cancelled')`,
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  const issuesSvc = issueService(db);
+
+  if (existing) {
+    if (!shouldEmitAlert(opts.companyId, opts.provider, opts.level)) {
+      return existing.id;
+    }
+    const commentLines = [
+      `Quota alert still active for \`${opts.provider}\` (${opts.level}).`,
+      ...(opts.peakPercent != null ? [`- Peak utilization: \`${opts.peakPercent.toFixed(1)}%\``] : []),
+      ...(typeof opts.pausedCount === "number" ? [`- Agents auto-paused this cycle: \`${opts.pausedCount}\``] : []),
+    ];
+    if (opts.errorMessage) {
+      commentLines.push("", "```text", opts.errorMessage.trim(), "```");
+    }
+    try {
+      await issuesSvc.addComment(existing.id, commentLines.join("\n"), {
+        agentId: opts.triggerAgentId ?? undefined,
+      });
+    } catch (err) {
+      logger.warn({ err, issueId: existing.id }, "quota-health: failed to append update comment to existing alert");
+    }
+    return existing.id;
+  }
+
   if (!shouldEmitAlert(opts.companyId, opts.provider, opts.level)) {
     return null;
   }
 
-  const issuesSvc = issueService(db);
   const assigneeAgentId = await resolveAlertAssigneeAgentId(db, opts.companyId);
   const title = buildAlertTitle(opts.provider, opts.level, opts.peakPercent);
   const lines = [
@@ -217,6 +257,8 @@ export async function createQuotaAlertIssue(
     priority: opts.level === "critical" ? "critical" : "high",
     assigneeAgentId: assigneeAgentId ?? undefined,
     createdByAgentId: opts.triggerAgentId ?? null,
+    originKind,
+    originId,
   });
   return created.id;
 }

@@ -202,6 +202,7 @@ export async function testEnvironment(
           timeoutSec: 45,
           graceSec: 5,
           onLog: async () => {},
+          adapterType: "cursor_local",
         },
       );
       const parsed = parseCursorJsonl(probe.stdout);

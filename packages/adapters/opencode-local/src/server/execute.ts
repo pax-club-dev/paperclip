@@ -335,6 +335,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         onSpawn,
         onLog,
         sandbox,
+        adapterType: "opencode_local",
       });
       return {
         proc,

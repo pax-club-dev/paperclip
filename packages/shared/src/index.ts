@@ -355,6 +355,8 @@ export {
   DEFAULT_FEEDBACK_DATA_SHARING_TERMS_VERSION,
 } from "./types/feedback.js";
 
+export { deriveIsBlocked, isBlockerResolved } from "./types/issue.js";
+
 export {
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,

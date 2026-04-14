@@ -36,6 +36,8 @@ import {
   reconcilePersistedRuntimeServicesOnStartup,
   routineService,
 } from "./services/index.js";
+import { createResourceMonitor } from "./services/resource-monitor.js";
+import { bootstrapResourceBudget } from "./services/resource-budget-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -633,6 +635,10 @@ export async function startServer(): Promise<StartedServer> {
       logger.error({ err }, "startup reconciliation of persisted runtime services failed");
     });
   
+  bootstrapResourceBudget();
+  const resourceMonitor = createResourceMonitor();
+  resourceMonitor.logStartup();
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any);
     const routines = routineService(db as any);
@@ -650,6 +656,8 @@ export async function startServer(): Promise<StartedServer> {
       logger.error({ err }, "ghost agent cleanup failed");
     });
     setInterval(() => {
+      resourceMonitor.sample();
+
       void heartbeat
         .tickTimers(new Date())
         .then((result) => {

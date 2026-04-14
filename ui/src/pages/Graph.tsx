@@ -210,8 +210,8 @@ const nodeTypes: NodeTypes = {
 
 // ── Filter Bar ──────────────────────────────────────────────────────────────
 
-const ALL_STATUSES = ["todo", "in_progress", "in_review", "blocked", "backlog", "done", "cancelled"];
-const ACTIVE_STATUSES = ["todo", "in_progress", "in_review", "blocked"];
+const ALL_STATUSES = ["todo", "in_progress", "in_review", "backlog", "done", "cancelled"];
+const ACTIVE_STATUSES = ["todo", "in_progress", "in_review"];
 
 // ── Main Graph Page ─────────────────────────────────────────────────────────
 

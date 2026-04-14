@@ -372,6 +372,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onSpawn,
       onLog,
       sandbox: sandboxConfig,
+      adapterType: "gemini_local",
     });
     return {
       proc,

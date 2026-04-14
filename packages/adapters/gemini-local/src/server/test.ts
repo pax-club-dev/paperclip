@@ -162,6 +162,7 @@ export async function testEnvironment(
           timeoutSec: helloProbeTimeoutSec,
           graceSec: 5,
           onLog: async () => { },
+          adapterType: "gemini_local",
         },
       );
       const parsed = parseGeminiJsonl(probe.stdout);

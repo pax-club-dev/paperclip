@@ -133,6 +133,7 @@ export async function discoverOpenCodeModels(input: {
       timeoutSec: MODELS_DISCOVERY_TIMEOUT_MS / 1000,
       graceSec: 3,
       onLog: async () => {},
+      adapterType: "opencode_local",
     },
   );
 

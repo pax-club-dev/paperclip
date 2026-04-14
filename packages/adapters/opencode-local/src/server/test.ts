@@ -257,6 +257,7 @@ export async function testEnvironment(
             graceSec: 5,
             stdin: "Respond with hello.",
             onLog: async () => {},
+            adapterType: "opencode_local",
           },
         );
 

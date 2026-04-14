@@ -33,11 +33,15 @@ export function activityRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
 
+    const rawLimit = req.query.limit;
+    const parsedLimit =
+      typeof rawLimit === "string" && rawLimit.length > 0 ? Number.parseInt(rawLimit, 10) : NaN;
     const filters = {
       companyId,
       agentId: req.query.agentId as string | undefined,
       entityType: req.query.entityType as string | undefined,
       entityId: req.query.entityId as string | undefined,
+      limit: Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : undefined,
     };
     const result = await svc.list(filters);
     res.json(result);

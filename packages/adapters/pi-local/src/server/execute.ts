@@ -416,6 +416,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onSpawn,
       onLog: bufferedOnLog,
       sandbox,
+      adapterType: "pi_local",
     });
     
     // Flush any remaining buffer content

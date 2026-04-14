@@ -120,6 +120,7 @@ export async function discoverPiModels(input: {
       timeoutSec: 20,
       graceSec: 3,
       onLog: async () => {},
+      adapterType: "pi_local",
     },
   );
 

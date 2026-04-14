@@ -453,6 +453,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
         await flushStdoutChunk(chunk);
       },
+      adapterType: "cursor_local",
     });
     await flushStdoutChunk("", true);
 

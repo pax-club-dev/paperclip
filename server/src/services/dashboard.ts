@@ -1,6 +1,6 @@
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, eq, gte, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, approvals, companies, costEvents, issues } from "@paperclipai/db";
+import { agents, approvals, companies, costEvents, issueRelations, issues } from "@paperclipai/db";
 import { notFound } from "../errors.js";
 import { budgetService } from "./budgets.js";
 
@@ -56,10 +56,24 @@ export function dashboardService(db: Db) {
       for (const row of taskRows) {
         const count = Number(row.count);
         if (row.status === "in_progress") taskCounts.inProgress += count;
-        if (row.status === "blocked") taskCounts.blocked += count;
         if (row.status === "done") taskCounts.done += count;
         if (row.status !== "done" && row.status !== "cancelled") taskCounts.open += count;
       }
+
+      // Blocked = open issues that have at least one non-terminal blocker via
+      // issue_relations. Orthogonal to the status axis.
+      taskCounts.blocked = await db
+        .select({ count: sql<number>`count(distinct ${issueRelations.relatedIssueId})::int` })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issues.id, issueRelations.issueId))
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.type, "blocks"),
+            notInArray(issues.status, ["done", "cancelled"]),
+          ),
+        )
+        .then((rows) => Number(rows[0]?.count ?? 0));
 
       const now = new Date();
       const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);

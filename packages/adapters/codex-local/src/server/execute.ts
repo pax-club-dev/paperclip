@@ -552,6 +552,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await onLog(stream, cleaned);
       },
       sandbox,
+      adapterType: "codex_local",
     });
     const cleanedStderr = stripCodexRolloutNoise(proc.stderr);
     return {

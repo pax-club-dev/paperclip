@@ -7,6 +7,8 @@ import type {
 } from "./types.js";
 import { type SandboxConfig, wrapWithSandbox } from "./sandbox.js";
 export type { SandboxConfig } from "./sandbox.js";
+import { wrapWithMemoryCgroup } from "./memory-cgroup.js";
+import { acquireResourceGrant, type ResourceGrant } from "./resource-budget.js";
 
 export interface RunProcessResult {
   exitCode: number | null;
@@ -18,9 +20,19 @@ export interface RunProcessResult {
   startedAt: string | null;
 }
 
-interface RunningProcess {
+export interface RunningProcess {
   child: ChildProcess;
   graceSec: number;
+  /** Adapter type (e.g. "claude_local"). Present when runChildProcess knew the type. */
+  adapterType?: string;
+  /** Systemd scope unit name — deterministic from runId. */
+  scopeUnit?: string;
+  /** Memory reservation for budget math, MB. */
+  reservationMB?: number;
+  /** Kernel hard cap (systemd MemoryMax), MB. */
+  capMB?: number;
+  /** Resource-budget grant handle — monitor uses this for recordPeakMB. */
+  grant?: ResourceGrant;
 }
 
 interface SpawnTarget {
@@ -1000,11 +1012,34 @@ export async function runChildProcess(
     stdin?: string;
     /** When set, wraps the child process in a bubblewrap sandbox for filesystem isolation. */
     sandbox?: SandboxConfig;
+    /**
+     * Per-run memory cap enforced via a systemd-run user scope (cgroup v2).
+     * Value is the MemoryMax string (e.g. "1G", "512M"). When unset, defaults
+     * to the resource-budget per-adapter cap. Disabled entirely by
+     * PAPERCLIP_DISABLE_MEMORY_CAPS=1 or when systemd-run is unavailable.
+     */
+    memoryLimit?: string;
+    /**
+     * Adapter type (e.g. "claude_local"). Drives per-adapter memory defaults
+     * and admission-control budget. When unset, the resource-budget defaultType
+     * is used (conservative).
+     */
+    adapterType?: string;
+    /**
+     * Priority for admission queue ordering; higher = admitted earlier among
+     * same-type waiters. Defaults to 0.
+     */
+    priority?: number;
   },
 ): Promise<RunProcessResult> {
   const onLogError = opts.onLogError ?? ((err, id, msg) => console.warn({ err, runId: id }, msg));
 
-  return new Promise<RunProcessResult>((resolve, reject) => {
+  const grant = await acquireResourceGrant({
+    runId,
+    adapterType: opts.adapterType ?? "unknown",
+    priority: opts.priority,
+  });
+  const promise = new Promise<RunProcessResult>((resolve, reject) => {
     const rawMerged: NodeJS.ProcessEnv = { ...process.env, ...opts.env };
 
     // Strip Claude Code nesting-guard env vars so spawned `claude` processes
@@ -1034,11 +1069,23 @@ export async function runChildProcess(
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv)
       .then((target) => {
         // Apply sandbox wrapping if configured
-        const spawnTarget = opts.sandbox
+        const sandboxed = opts.sandbox
           ? wrapWithSandbox(opts.sandbox, target.command, target.args, {
               onWarn: (msg) => onLogError(null, runId, `[sandbox] ${msg}`),
             })
           : target;
+
+        // Wrap in a per-run systemd-run scope so the kernel OOM-kills only this
+        // adapter tree if it exceeds its cap, instead of taking down the server.
+        // Scope unit name comes from the resource-budget grant — deterministic,
+        // so the resource-monitor can read the scope's cgroup memory.current
+        // without racing the PID→cgroup lookup.
+        const spawnTarget = wrapWithMemoryCgroup(sandboxed.command, sandboxed.args, {
+          memoryMax: opts.memoryLimit ?? `${grant.capMB}M`,
+          unitName: grant.scopeUnit,
+          adapterType: opts.adapterType,
+          onWarn: (msg) => onLogError(null, runId, `[memory-cgroup] ${msg}`),
+        });
 
         const child = spawn(spawnTarget.command, spawnTarget.args, {
           cwd: opts.cwd,
@@ -1059,7 +1106,15 @@ export async function runChildProcess(
           });
         }
 
-        runningProcesses.set(runId, { child, graceSec: opts.graceSec });
+        runningProcesses.set(runId, {
+          child,
+          graceSec: opts.graceSec,
+          adapterType: opts.adapterType,
+          scopeUnit: grant.scopeUnit,
+          reservationMB: grant.reservationMB,
+          capMB: grant.capMB,
+          grant,
+        });
 
         let timedOut = false;
         let stdout = "";
@@ -1153,4 +1208,5 @@ export async function runChildProcess(
       })
       .catch(reject);
   });
+  return promise.finally(() => grant.release());
 }

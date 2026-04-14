@@ -228,6 +228,7 @@ export async function testEnvironment(
           timeoutSec: 60,
           graceSec: 5,
           onLog: async () => {},
+          adapterType: "pi_local",
         },
       );
 

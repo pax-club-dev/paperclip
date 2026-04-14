@@ -1,5 +1,5 @@
 #!/usr/bin/env -S node --import tsx
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -82,6 +82,56 @@ const env: NodeJS.ProcessEnv = {
   ...process.env,
   PAPERCLIP_UI_DEV_MIDDLEWARE: "true",
 };
+
+// ---------------------------------------------------------------------------
+// Memory caps — prevent server or its descendants from OOM-ing the host.
+//
+// Step 1 (heap cap): --max-old-space-size bounds the Node V8 heap. Exceeding
+//   it throws "JS heap out of memory" inside the process instead of eating
+//   system RAM.
+// Step 2 (cgroup cap): systemd-run --scope places the server + all its
+//   descendants (adapters, plugin workers, signal-cli, etc.) in a transient
+//   cgroup with MemoryMax. If the group exceeds the cap, the kernel OOM-kills
+//   inside the scope — the host stays up with free memory to recover.
+//
+// Env knobs:
+//   PAPERCLIP_SERVER_HEAP_MB        — V8 heap cap for the server (default 2048)
+//   PAPERCLIP_MEMORY_MAX            — cgroup cap for scope (default "12G")
+//   PAPERCLIP_DISABLE_MEMORY_CAPS=1 — skip both (escape hatch)
+// ---------------------------------------------------------------------------
+const memoryCapsDisabled = process.env.PAPERCLIP_DISABLE_MEMORY_CAPS === "1";
+const serverHeapMb = Number.parseInt(process.env.PAPERCLIP_SERVER_HEAP_MB ?? "2048", 10);
+const cgroupMemoryMax = process.env.PAPERCLIP_MEMORY_MAX ?? "12G";
+
+if (!memoryCapsDisabled && Number.isFinite(serverHeapMb) && serverHeapMb > 0) {
+  const heapFlag = `--max-old-space-size=${serverHeapMb}`;
+  env.NODE_OPTIONS = env.NODE_OPTIONS
+    ? `${heapFlag} ${env.NODE_OPTIONS}`
+    : heapFlag;
+  console.log(`[paperclip] node heap cap: ${serverHeapMb}MB (PAPERCLIP_SERVER_HEAP_MB)`);
+}
+
+function detectSystemdRunAvailable(): boolean {
+  if (memoryCapsDisabled) return false;
+  if (process.platform !== "linux") return false;
+  if (!existsSync("/usr/bin/systemd-run") && !existsSync("/bin/systemd-run")) return false;
+  // Verify the user systemd instance accepts scope creation. Without this,
+  // systemd-run will fail at spawn time on hosts with no user manager.
+  const probe = spawnSync("systemd-run", ["--user", "--scope", "--quiet", "--", "true"], {
+    stdio: "ignore",
+  });
+  return probe.status === 0;
+}
+
+const useSystemdScope = detectSystemdRunAvailable();
+if (!memoryCapsDisabled && !useSystemdScope) {
+  console.log(
+    "[paperclip] memory cgroup cap: unavailable (systemd-run --user --scope failed probe); " +
+      "host will rely on node heap cap only",
+  );
+} else if (useSystemdScope) {
+  console.log(`[paperclip] memory cgroup cap: ${cgroupMemoryMax} (PAPERCLIP_MEMORY_MAX)`);
+}
 
 if (mode === "dev") {
   env.PAPERCLIP_DEV_SERVER_STATUS_FILE = devServerStatusFilePath;
@@ -514,9 +564,32 @@ async function startServerChild() {
   await buildPluginSdk();
 
   const serverScript = mode === "watch" ? "dev:watch" : "dev";
+  const pnpmArgs = ["--filter", "@paperclipai/server", serverScript, ...forwardedArgs];
+
+  // When systemd-run is available, wrap the server process in a transient
+  // --scope so the server + all its descendants (adapters, plugin workers,
+  // signal-cli) share a cgroup with MemoryMax. If any subtree leaks, the
+  // kernel kills inside the scope; the host (and this dev-runner) survive.
+  const { command, commandArgs } = useSystemdScope
+    ? {
+        command: "systemd-run",
+        commandArgs: [
+          "--user",
+          "--scope",
+          "--quiet",
+          "--collect",
+          `--property=MemoryMax=${cgroupMemoryMax}`,
+          "--property=MemorySwapMax=0",
+          "--",
+          pnpmBin,
+          ...pnpmArgs,
+        ],
+      }
+    : { command: pnpmBin, commandArgs: pnpmArgs };
+
   child = spawn(
-    pnpmBin,
-    ["--filter", "@paperclipai/server", serverScript, ...forwardedArgs],
+    command,
+    commandArgs,
     { stdio: "inherit", env, shell: process.platform === "win32" },
   );
 

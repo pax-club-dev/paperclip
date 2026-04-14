@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -36,7 +36,7 @@ import { redactCurrentUserText } from "../log-redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 
-const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 
 function assertTransition(from: string, to: string) {
@@ -116,7 +116,7 @@ type IssueUserContextInput = {
   updatedAt: Date | string;
 };
 type ProjectGoalReader = Pick<Db, "select">;
-type DbReader = Pick<Db, "select">;
+type DbReader = Pick<Db, "select" | "selectDistinct">;
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
@@ -773,6 +773,28 @@ export function issueService(db: Db) {
     return empty;
   }
 
+  async function computeBlockedSetInternal(
+    companyId: string,
+    issueIds: string[],
+    dbOrTx: DbReader = db,
+  ): Promise<Set<string>> {
+    const unique = [...new Set(issueIds)];
+    if (unique.length === 0) return new Set();
+    const rows = await dbOrTx
+      .selectDistinct({ relatedIssueId: issueRelations.relatedIssueId })
+      .from(issueRelations)
+      .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.type, "blocks"),
+          inArray(issueRelations.relatedIssueId, unique),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+    return new Set(rows.map((r) => r.relatedIssueId));
+  }
+
   async function assertNoBlockingCycles(
     companyId: string,
     issueId: string,
@@ -1146,6 +1168,7 @@ export function issueService(db: Db) {
       ]);
       const statsByIssueId = new Map(statsRows.map((row) => [row.issueId, row]));
       const lastActivityByIssueId = new Map(lastActivityRows.map((row) => [row.issueId, row]));
+      const blockedIdSet = await computeBlockedSetInternal(companyId, issueIds, db);
 
       if (!contextUserId) {
         const mapped = withRuns.map((row) => {
@@ -1158,6 +1181,7 @@ export function issueService(db: Db) {
           return {
             ...row,
             lastActivityAt,
+            isBlocked: blockedIdSet.has(row.id),
           };
         });
         if (paginationLimit !== null && totalCount !== null) {
@@ -1178,6 +1202,7 @@ export function issueService(db: Db) {
         return {
           ...row,
           lastActivityAt,
+          isBlocked: blockedIdSet.has(row.id),
           ...deriveIssueUserContext(row, contextUserId, {
             myLastCommentAt: statsByIssueId.get(row.id)?.myLastCommentAt ?? null,
             myLastReadAt: readByIssueId.get(row.id) ?? null,
@@ -1315,6 +1340,17 @@ export function issueService(db: Db) {
       return getIssueRelationSummaryMap(companyId, issueIds, db);
     },
 
+    /**
+     * Returns the subset of `issueIds` that are currently blocked — i.e. have
+     * at least one blocker whose status is not done/cancelled. Used to attach
+     * a derived `isBlocked` flag to issue responses without forcing callers to
+     * hydrate the full blockedBy relation summaries.
+     */
+    computeBlockedIssueIds: async (
+      companyId: string,
+      issueIds: string[],
+    ): Promise<Set<string>> => computeBlockedSetInternal(companyId, issueIds, db),
+
     listWakeableBlockedDependents: async (blockerIssueId: string) => {
       const blockerIssue = await db
         .select({ id: issues.id, companyId: issues.companyId })
@@ -1440,9 +1476,6 @@ export function issueService(db: Db) {
       }
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
-      }
-      if (data.status === "blocked" && (!blockedByIssueIds || blockedByIssueIds.length === 0)) {
-        throw unprocessable("Setting status to 'blocked' requires at least one blockedByIssueId. Specify which issue(s) are blocking this one.");
       }
       return db.transaction(async (tx) => {
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
@@ -1617,22 +1650,6 @@ export function issueService(db: Db) {
 
       if (issueData.status) {
         assertTransition(existing.status, issueData.status);
-        // Correct by construction: "blocked" requires at least one blocker
-        if (issueData.status === "blocked") {
-          const hasNewBlockers = Array.isArray(blockedByIssueIds) && blockedByIssueIds.length > 0;
-          if (!hasNewBlockers) {
-            const existingBlockers = await db
-              .select({ id: issueRelations.id })
-              .from(issueRelations)
-              .where(and(eq(issueRelations.relatedIssueId, id), eq(issueRelations.type, "blocks")))
-              .limit(1);
-            if (existingBlockers.length === 0) {
-              throw unprocessable(
-                "Setting status to 'blocked' requires at least one blockedByIssueId. Specify which issue(s) are blocking this one.",
-              );
-            }
-          }
-        }
       }
 
       const patch: Partial<typeof issues.$inferInsert> = {
