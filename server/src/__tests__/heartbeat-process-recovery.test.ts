@@ -195,6 +195,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
+  it("reaps a run even when it is tracked in runningProcesses if the tracked child is dead (PAX-150)", async () => {
+    const { agentId, runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    // Simulate a stale runningProcesses entry: the orchestrator believes it's
+    // managing a child, but the child process died without firing cleanup.
+    const deadChild = spawnAliveProcess();
+    childProcesses.add(deadChild);
+    const deadPid = deadChild.pid ?? 0;
+    expect(deadPid).toBeGreaterThan(0);
+    deadChild.kill("SIGKILL");
+    // Wait for kernel to actually reap the dead child so isProcessAlive returns false.
+    await new Promise<void>((resolve) => {
+      if (deadChild.exitCode !== null || deadChild.signalCode !== null) {
+        resolve();
+        return;
+      }
+      deadChild.once("exit", () => resolve());
+    });
+
+    runningProcesses.set(runId, {
+      child: deadChild,
+      graceSec: 5,
+      adapterType: "codex_local",
+    });
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+    // Stale entry must be evicted.
+    expect(runningProcesses.has(runId)).toBe(false);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const reapedRun = runs.find((row) => row.id === runId);
+    expect(reapedRun?.status).toBe("failed");
+    expect(reapedRun?.errorCode).toBe("process_lost");
+  });
+
   it("queues exactly one retry when the recorded local pid is dead", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       processPid: 999_999_999,

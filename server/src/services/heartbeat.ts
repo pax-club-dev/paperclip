@@ -2425,7 +2425,18 @@ export function heartbeatService(db: Db) {
     const reaped: string[] = [];
 
     for (const { run, adapterType } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      if (activeRunExecutions.has(run.id)) continue;
+
+      // runningProcesses usually tracks a live child, but the child may have
+      // died without firing its close handler (crash, SIGKILL, cgroup OOM).
+      // Verify the tracked pid is actually alive before skipping — otherwise
+      // evict the stale entry and fall through so the run can be reaped.
+      const trackedProc = runningProcesses.get(run.id);
+      if (trackedProc) {
+        const trackedPid = trackedProc.child.pid;
+        if (typeof trackedPid === "number" && isProcessAlive(trackedPid)) continue;
+        runningProcesses.delete(run.id);
+      }
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
