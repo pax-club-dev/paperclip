@@ -1990,18 +1990,29 @@ export function agentRoutes(db: Db) {
   });
 
   router.post("/agents/:id/resume", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    await assertCanUpdateAgent(req, existing);
     const agent = await svc.resume(id);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
 
+    const actorType = req.actor.type === "agent" ? "agent" : "user";
+    const actorId =
+      req.actor.type === "agent"
+        ? (req.actor.agentId ?? "agent")
+        : (req.actor.userId ?? "board");
+
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType,
+      actorId,
       action: "agent.resumed",
       entityType: "agent",
       entityId: agent.id,

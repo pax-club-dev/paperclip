@@ -39,6 +39,7 @@ const mockAgentService = vi.hoisted(() => ({
   updatePermissions: vi.fn(),
   getChainOfCommand: vi.fn(),
   resolveByReference: vi.fn(),
+  resume: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -175,6 +176,7 @@ describe("agent permission routes", () => {
     mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => config);
     mockSecretService.resolveAdapterConfigForRuntime.mockImplementation(async (_companyId, config) => ({ config }));
     mockLogActivity.mockResolvedValue(undefined);
+    mockAgentService.resume.mockResolvedValue({ ...baseAgent, status: "idle" });
   });
 
   it("grants tasks:assign by default when board creates a new agent", async () => {
@@ -310,5 +312,82 @@ describe("agent permission routes", () => {
         status: "todo",
       },
     ]);
+  });
+
+  describe("POST /agents/:id/resume (PAX-2300)", () => {
+    const managerId = "33333333-3333-4333-8333-333333333333";
+
+    it("allows a chain-of-command manager agent to resume a subordinate", async () => {
+      mockAgentService.getById.mockImplementation(async (id: string) => {
+        if (id === agentId) return { ...baseAgent, status: "paused" };
+        if (id === managerId) {
+          return { ...baseAgent, id: managerId, role: "coo", name: "COO" };
+        }
+        return null;
+      });
+      mockAgentService.getChainOfCommand.mockResolvedValue([
+        { id: managerId, role: "coo", name: "COO" },
+      ]);
+
+      const app = createApp({
+        type: "agent",
+        agentId: managerId,
+        companyId,
+        source: "agent_key",
+      });
+
+      const res = await request(app).post(`/api/agents/${agentId}/resume`).send({});
+      expect(res.status).toBe(200);
+      expect(mockAgentService.resume).toHaveBeenCalledWith(agentId);
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          actorType: "agent",
+          actorId: managerId,
+          action: "agent.resumed",
+        }),
+      );
+    });
+
+    it("rejects a peer agent outside the chain of command with 403", async () => {
+      const peerId = "44444444-4444-4444-8444-444444444444";
+      mockAgentService.getById.mockImplementation(async (id: string) => {
+        if (id === agentId) return { ...baseAgent, status: "paused" };
+        if (id === peerId) return { ...baseAgent, id: peerId, role: "engineer" };
+        return null;
+      });
+      mockAgentService.getChainOfCommand.mockResolvedValue([]);
+
+      const app = createApp({
+        type: "agent",
+        agentId: peerId,
+        companyId,
+        source: "agent_key",
+      });
+
+      const res = await request(app).post(`/api/agents/${agentId}/resume`).send({});
+      expect(res.status).toBe(403);
+      expect(mockAgentService.resume).not.toHaveBeenCalled();
+    });
+
+    it("still allows the board to resume any agent", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, status: "paused" });
+
+      const app = createApp({
+        type: "board",
+        userId: "board-user",
+        source: "local_implicit",
+        isInstanceAdmin: true,
+        companyIds: [companyId],
+      });
+
+      const res = await request(app).post(`/api/agents/${agentId}/resume`).send({});
+      expect(res.status).toBe(200);
+      expect(mockAgentService.resume).toHaveBeenCalledWith(agentId);
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ actorType: "user", actorId: "board-user" }),
+      );
+    });
   });
 });
