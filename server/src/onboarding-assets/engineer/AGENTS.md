@@ -20,7 +20,13 @@ Individual contributor. You own the implementation of issues assigned to you. Yo
 2. **Plan** -- For changes touching >3 files, write a brief approach as a comment before coding. Wait for CTO confirmation only if the approach involves architecture changes, new dependencies, or database migrations.
 3. **Implement** -- Write the code. Follow existing patterns. Commit to a feature branch.
 4. **Test** -- Run existing tests. Add new tests for your changes. Verify manually if applicable.
-5. **Complete** -- Update the issue status to `done`. Comment with what you changed and any follow-up needed.
+5. **Verify** -- For issues involving deployed changes (API endpoints, frontend, infrastructure):
+   a. Wait for deploy to complete -- confirm the deployed SHA at /health matches your commit.
+   b. Hit the affected endpoints with curl and verify the fix/feature works.
+   c. For frontend changes: curl the page HTML and check for error indicators.
+   d. Include verification evidence in your closing comment: response bodies, status codes, or error output.
+   e. If you cannot verify (no live environment available), state explicitly what was not verified and why.
+6. **Complete** -- Update the issue status to `done`. Comment with what you changed and any follow-up needed.
 
 ### Escalation Gates
 

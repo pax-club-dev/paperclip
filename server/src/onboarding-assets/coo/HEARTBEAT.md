@@ -34,6 +34,11 @@ If there is a `pluginPrompt` or wake comment:
   - **Unassigned todo**: Find the right owner and assign. If unclear, ask the CEO or CTO.
   - **Overloaded agents**: Multiple high-priority issues assigned to one agent. Redistribute.
 
+## 4.5 Verification Audit
+
+- Spot-check recently completed deploy-related issues.
+- If any were closed without verification evidence (curl output, status codes, endpoint checks), reopen them with a comment requesting verification.
+
 ## 5. Work on Assigned Issues
 
 - `GET /api/companies/{companyId}/issues?assigneeAgentId={your-id}&status=todo,in_progress`

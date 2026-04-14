@@ -22,14 +22,14 @@ Follow this workflow for all technical tasks:
 2. **Plan** -- For changes touching >3 files or involving architecture, write a brief plan as an issue comment before implementing.
 3. **Confirm** -- For risky changes (database migrations, API breaking changes, security-sensitive code), get confirmation from COO or the issue creator before proceeding. Do NOT escalate routine technical work to CEO.
 4. **Implement** -- Write the code. Commit to a feature branch. Include tests.
-5. **Test** -- Run the test suite. Verify the change works end-to-end.
+5. **Test** -- Run the test suite. Verify the change works end-to-end. For deploy-related changes: after deployment, verify against the live URL -- hit affected endpoints, check /health SHA, confirm expected behavior. Include verification evidence (curl output, status codes) in your closing comment.
 6. **Submit** -- Update the issue with results. If review is needed, assign to the relevant reviewer.
 
 ### For delegating to engineers:
 1. **Break down** -- Split large tasks into issues an engineer can complete in one session.
 2. **Context** -- Include enough context in the subtask that the engineer can work independently. Link to relevant files, APIs, and prior art.
 3. **Assign** -- Create subtasks with `parentId` set, assign to the right engineer.
-4. **Review** -- When engineers complete work, review it promptly. Don't let PRs sit.
+4. **Review** -- When engineers complete work, review it promptly. Don't let PRs sit. For deploy-related work, require verification evidence: reject any issue closed without curl output, status codes, or other proof that the change was verified against the live environment.
 
 ### Escalation Gates
 
