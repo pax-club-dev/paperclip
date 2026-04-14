@@ -4,6 +4,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { definePlugin, runWorker, } from "@paperclipai/plugin-sdk";
 import { BREACH_DEADLINE_MS, BREACH_LOG_FILE_PATH, BREACH_LOG_KEY, DEFAULT_OUTBOUND_PER_AGENT_PER_MINUTE_LIMIT, FAST_ACK_DEADLINE_MS, FOUNDER_REQUEST_LABEL_NAMES, INBOX_MSG_PREFIX, INBOX_NOTIFICATION_NAMESPACE, JOB_KEYS, MAX_BREACH_LOG_ENTRIES, MESSAGE_LOG_NAMESPACE, MESSAGE_LOG_PREFIX, OUTBOUND_RATE_LIMIT_NAMESPACE, PENDING_MSG_PREFIX, SLA_NAMESPACE, WEBHOOK_KEYS, } from "./constants.js";
 import { resolveRouting } from "./routing.js";
+import { formatQuoteContext } from "./quote-context.js";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -713,6 +714,7 @@ async function markResponded(msgId) {
 // ---------------------------------------------------------------------------
 async function handleSignalMessage(payload) {
     const msgId = `${payload.sender}-${payload.timestamp}`;
+    const quotePrefix = formatQuoteContext(payload.quote);
     const receivedAt = Date.now();
     ctx.logger.info("Signal message received", {
         messageId: msgId,
@@ -750,6 +752,8 @@ async function handleSignalMessage(payload) {
         content: payload.message,
         signalTimestamp: payload.timestamp,
         routedToAgentId: targetAgentIds[0] ?? null,
+        quoteText: payload.quote?.text ?? null,
+        quoteAuthor: payload.quote?.author ? maskSender(payload.quote.author) : null,
     });
     await ctx.metrics.write("signal.message_received", 1, {
         has_mention: hasExplicitMentions ? "true" : "false",
@@ -783,7 +787,7 @@ async function handleSignalMessage(payload) {
             pending.sessionIds.push(session.sessionId);
             await setPending(pending);
             await ctx.agents.sessions.sendMessage(session.sessionId, companyId, {
-                prompt: payload.message,
+                prompt: quotePrefix + payload.message,
                 reason: `Signal message from ${maskSender(payload.sender)}`,
                 onEvent: (event) => {
                     if (event.eventType === "done" && event.message) {
