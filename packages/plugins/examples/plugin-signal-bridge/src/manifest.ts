@@ -135,7 +135,7 @@ const manifest: PaperclipPluginManifestV1 = {
       endpointKey: WEBHOOK_KEYS.signalIngest,
       displayName: "Signal Message Ingest",
       description:
-        "Receives inbound Signal messages from the signal-cli bridge. Expected payload: { sender, timestamp, message, groupId?, mentions? }",
+        "Receives inbound Signal messages from the signal-cli bridge. Expected payload: { sender, timestamp, message, groupId?, mentions?, quote?: { id, author, text } }",
     },
   ],
 };
