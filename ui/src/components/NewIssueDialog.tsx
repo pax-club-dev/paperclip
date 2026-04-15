@@ -871,9 +871,11 @@ export function NewIssueDialog() {
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Popover open={companyOpen} onOpenChange={setCompanyOpen}>
               <PopoverTrigger asChild>
-                <button
+                <Button
+                  variant="ghost"
+                  size="sm"
                   className={cn(
-                    "px-1.5 py-0.5 rounded text-xs font-semibold cursor-pointer hover:opacity-80 transition-opacity",
+                    "h-auto px-1.5 py-0.5 rounded text-xs font-semibold cursor-pointer hover:opacity-80 transition-opacity",
                     !dialogCompany?.brandColor && "bg-muted",
                   )}
                   style={
@@ -886,14 +888,16 @@ export function NewIssueDialog() {
                   }
                 >
                   {(dialogCompany?.name ?? "").slice(0, 3).toUpperCase()}
-                </button>
+                </Button>
               </PopoverTrigger>
               <PopoverContent className="w-48 p-1" align="start">
                 {companies.filter((c) => c.status !== "archived" && c.environment === activeEnvironment).map((c) => (
-                  <button
+                  <Button
                     key={c.id}
+                    variant="ghost"
+                    size="sm"
                     className={cn(
-                      "flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50",
+                      "w-full justify-start flex items-center gap-2 px-2 py-1.5 text-xs rounded hover:bg-accent/50",
                       c.id === effectiveCompanyId && "bg-accent",
                     )}
                     onClick={() => {
@@ -918,7 +922,7 @@ export function NewIssueDialog() {
                       {c.name.slice(0, 3).toUpperCase()}
                     </span>
                     <span className="truncate">{c.name}</span>
-                  </button>
+                  </Button>
                 ))}
               </PopoverContent>
             </Popover>
@@ -1135,13 +1139,15 @@ export function NewIssueDialog() {
 
         {supportsAssigneeOverrides && (
           <div className="px-4 pb-2 shrink-0">
-            <button
-              className="inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
+            <Button
+              variant="ghost"
+              className="h-auto p-0 inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
               onClick={() => setAssigneeOptionsOpen((open) => !open)}
+              aria-expanded={assigneeOptionsOpen}
             >
               {assigneeOptionsOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
               {assigneeOptionsTitle}
-            </button>
+            </Button>
             {assigneeOptionsOpen && (
               <div className="mt-2 rounded-md border border-border p-3 bg-muted/20 space-y-3">
                 <div className="space-y-1.5">
@@ -1161,16 +1167,19 @@ export function NewIssueDialog() {
                   <div className="text-xs text-muted-foreground">Thinking effort</div>
                   <div className="flex items-center gap-1.5 flex-wrap">
                     {thinkingEffortOptions.map((option) => (
-                      <button
+                      <Button
                         key={option.value || "default"}
+                        variant="outline"
+                        size="sm"
                         className={cn(
-                          "px-2 py-1 rounded-md text-xs border border-border hover:bg-accent/50 transition-colors",
+                          "px-2 py-1 rounded-md text-xs hover:bg-accent/50 transition-colors",
                           assigneeThinkingEffort === option.value && "bg-accent"
                         )}
                         onClick={() => setAssigneeThinkingEffort(option.value)}
+                        aria-pressed={assigneeThinkingEffort === option.value}
                       >
                         {option.label}
-                      </button>
+                      </Button>
                     ))}
                   </div>
                 </div>
@@ -1293,24 +1302,26 @@ export function NewIssueDialog() {
           {/* Status chip */}
           <Popover open={statusOpen} onOpenChange={setStatusOpen}>
             <PopoverTrigger asChild>
-              <button className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors">
+              <Button variant="outline" size="sm" className="h-7 inline-flex items-center gap-1.5 px-2 py-1 text-xs hover:bg-accent/50 transition-colors">
                 <CircleDot className={cn("h-3 w-3", currentStatus.color)} />
                 {currentStatus.label}
-              </button>
+              </Button>
             </PopoverTrigger>
             <PopoverContent className="w-36 p-1" align="start">
               {statuses.map((s) => (
-                <button
+                <Button
                   key={s.value}
+                  variant="ghost"
+                  size="sm"
                   className={cn(
-                    "flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50",
+                    "w-full justify-start flex items-center gap-2 px-2 py-1.5 text-xs rounded hover:bg-accent/50",
                     s.value === status && "bg-accent"
                   )}
                   onClick={() => { setStatus(s.value); setStatusOpen(false); }}
                 >
                   <CircleDot className={cn("h-3 w-3", s.color)} />
                   {s.label}
-                </button>
+                </Button>
               ))}
             </PopoverContent>
           </Popover>
@@ -1318,7 +1329,7 @@ export function NewIssueDialog() {
           {/* Priority chip */}
           <Popover open={priorityOpen} onOpenChange={setPriorityOpen}>
             <PopoverTrigger asChild>
-              <button className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors">
+              <Button variant="outline" size="sm" className="h-7 inline-flex items-center gap-1.5 px-2 py-1 text-xs hover:bg-accent/50 transition-colors">
                 {currentPriority ? (
                   <>
                     <currentPriority.icon className={cn("h-3 w-3", currentPriority.color)} />
@@ -1330,30 +1341,32 @@ export function NewIssueDialog() {
                     Priority
                   </>
                 )}
-              </button>
+              </Button>
             </PopoverTrigger>
             <PopoverContent className="w-36 p-1" align="start">
               {priorities.map((p) => (
-                <button
+                <Button
                   key={p.value}
+                  variant="ghost"
+                  size="sm"
                   className={cn(
-                    "flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50",
+                    "w-full justify-start flex items-center gap-2 px-2 py-1.5 text-xs rounded hover:bg-accent/50",
                     p.value === priority && "bg-accent"
                   )}
                   onClick={() => { setPriority(p.value); setPriorityOpen(false); }}
                 >
                   <p.icon className={cn("h-3 w-3", p.color)} />
                   {p.label}
-                </button>
+                </Button>
               ))}
             </PopoverContent>
           </Popover>
 
           {/* Labels chip (placeholder) */}
-          <button className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors text-muted-foreground">
+          <Button variant="outline" size="sm" className="h-7 inline-flex items-center gap-1.5 px-2 py-1 text-xs hover:bg-accent/50 transition-colors text-muted-foreground">
             <Tag className="h-3 w-3" />
             Labels
-          </button>
+          </Button>
 
           <input
             ref={stageFileInputRef}
@@ -1363,31 +1376,33 @@ export function NewIssueDialog() {
             onChange={handleStageFilesPicked}
             multiple
           />
-          <button
-            className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors text-muted-foreground"
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 inline-flex items-center gap-1.5 px-2 py-1 text-xs hover:bg-accent/50 transition-colors text-muted-foreground"
             onClick={() => stageFileInputRef.current?.click()}
             disabled={createIssue.isPending}
           >
             <Paperclip className="h-3 w-3" />
             Upload
-          </button>
+          </Button>
 
           {/* More (dates) */}
           <Popover open={moreOpen} onOpenChange={setMoreOpen}>
             <PopoverTrigger asChild>
-              <button className="inline-flex items-center justify-center rounded-md border border-border p-1 text-xs hover:bg-accent/50 transition-colors text-muted-foreground">
+              <Button variant="outline" size="icon" className="h-7 w-7 inline-flex items-center justify-center p-1 text-xs hover:bg-accent/50 transition-colors text-muted-foreground" aria-label="More options">
                 <MoreHorizontal className="h-3 w-3" />
-              </button>
+              </Button>
             </PopoverTrigger>
             <PopoverContent className="w-44 p-1" align="start">
-              <button className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-muted-foreground">
+              <Button variant="ghost" size="sm" className="w-full justify-start flex items-center gap-2 px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-muted-foreground">
                 <Calendar className="h-3 w-3" />
                 Start date
-              </button>
-              <button className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-muted-foreground">
+              </Button>
+              <Button variant="ghost" size="sm" className="w-full justify-start flex items-center gap-2 px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-muted-foreground">
                 <Calendar className="h-3 w-3" />
                 Due date
-              </button>
+              </Button>
             </PopoverContent>
           </Popover>
         </div>
