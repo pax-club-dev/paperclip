@@ -710,18 +710,159 @@ async function markResponded(msgId) {
     setTimeout(() => deletePending(msgId), 5 * 60 * 1000);
 }
 // ---------------------------------------------------------------------------
+// Inbound image attachment helpers
+// ---------------------------------------------------------------------------
+
+/** MIME types we accept as images from Signal attachments. */
+const IMAGE_CONTENT_TYPES = new Set([
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+]);
+
+/** Maximum attachment size we will fetch and base64-encode (5 MiB). */
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Fetch a Signal attachment by ID from the signal-cli REST API and return it
+ * as a base64-encoded content block suitable for `sendMessage`.
+ *
+ * Returns `null` if the attachment cannot be fetched, is too large, or is not
+ * an image type we support.
+ */
+async function fetchAttachmentAsContentBlock(
+    attachment: { contentType?: string; id?: string; size?: number; filename?: string },
+): Promise<{ type: "image"; source: { type: "base64"; media_type: string; data: string } } | null> {
+    const contentType = attachment.contentType ?? "";
+    if (!IMAGE_CONTENT_TYPES.has(contentType)) {
+        ctx.logger.debug("Skipping non-image attachment", {
+            contentType,
+            filename: attachment.filename ?? null,
+        });
+        return null;
+    }
+
+    if (!attachment.id) {
+        ctx.logger.warn("Attachment missing id — cannot fetch", {
+            contentType,
+            filename: attachment.filename ?? null,
+        });
+        return null;
+    }
+
+    if (attachment.size && attachment.size > MAX_ATTACHMENT_BYTES) {
+        ctx.logger.warn("Attachment too large — skipping", {
+            id: attachment.id,
+            size: attachment.size,
+            maxBytes: MAX_ATTACHMENT_BYTES,
+        });
+        return null;
+    }
+
+    if (!config.signalBridgeUrl) {
+        ctx.logger.warn("signalBridgeUrl not configured — cannot fetch attachment");
+        return null;
+    }
+
+    try {
+        const headers = await getSignalAuthHeaders();
+        const res = await ctx.http.fetch(
+            `${config.signalBridgeUrl}/v1/attachments/${encodeURIComponent(attachment.id)}`,
+            { method: "GET", headers },
+        );
+
+        if (res.status !== 200) {
+            ctx.logger.warn("Failed to fetch attachment from Signal bridge", {
+                id: attachment.id,
+                status: res.status,
+                statusText: res.statusText,
+            });
+            return null;
+        }
+
+        // The http.fetch helper returns the body as a string.
+        // The signal-cli REST API returns binary data; the SDK http.fetch
+        // helper base64-encodes binary responses for transport over JSON-RPC,
+        // so `res.body` is already a base64 string for binary content types.
+        // If not, we encode it ourselves.
+        let base64Data: string;
+        if (/^[A-Za-z0-9+/\r\n]+=*$/.test(res.body.slice(0, 200))) {
+            // Already looks like base64
+            base64Data = res.body.replace(/[\r\n]/g, "");
+        } else {
+            base64Data = Buffer.from(res.body, "binary").toString("base64");
+        }
+
+        ctx.logger.info("Fetched image attachment", {
+            id: attachment.id,
+            contentType,
+            base64Length: base64Data.length,
+        });
+
+        return {
+            type: "image" as const,
+            source: {
+                type: "base64" as const,
+                media_type: contentType,
+                data: base64Data,
+            },
+        };
+    } catch (err) {
+        ctx.logger.error("Error fetching attachment from Signal bridge", {
+            error: String(err),
+            id: attachment.id,
+        });
+        return null;
+    }
+}
+
+/**
+ * Process an array of Signal attachments and return content blocks for images.
+ */
+async function buildImageContentBlocks(
+    attachments: Array<{ contentType?: string; id?: string; size?: number; filename?: string }> | undefined | null,
+): Promise<Array<
+    | { type: "text"; text: string }
+    | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
+>> {
+    if (!attachments || attachments.length === 0) return [];
+
+    const blocks: Array<
+        | { type: "text"; text: string }
+        | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
+    > = [];
+
+    for (const att of attachments) {
+        const block = await fetchAttachmentAsContentBlock(att);
+        if (block) {
+            blocks.push(block);
+        }
+    }
+
+    return blocks;
+}
+
+// ---------------------------------------------------------------------------
 // Main message handler: receive Signal message, route to agent
 // ---------------------------------------------------------------------------
 async function handleSignalMessage(payload) {
     const msgId = `${payload.sender}-${payload.timestamp}`;
     const quotePrefix = formatQuoteContext(payload.quote);
     const receivedAt = Date.now();
+    const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
     ctx.logger.info("Signal message received", {
         messageId: msgId,
         sender: maskSender(payload.sender),
         hasText: !!payload.message,
+        attachmentCount: attachments.length,
     });
-    const routing = await resolveTargetAgents(payload.message, payload.mentions);
+
+    // Build content blocks from image attachments (runs in parallel with routing)
+    const [routing, contentBlocks] = await Promise.all([
+        resolveTargetAgents(payload.message, payload.mentions),
+        buildImageContentBlocks(attachments),
+    ]);
     const hasExplicitMentions = routing.mentionTokens.length > 0;
     const resolvedTargets = routing.targets;
     const fallbackTargets = hasExplicitMentions
@@ -754,10 +895,13 @@ async function handleSignalMessage(payload) {
         routedToAgentId: targetAgentIds[0] ?? null,
         quoteText: payload.quote?.text ?? null,
         quoteAuthor: payload.quote?.author ? maskSender(payload.quote.author) : null,
+        attachmentCount: attachments.length,
+        imageContentBlockCount: contentBlocks.filter((b) => b.type === "image").length,
     });
     await ctx.metrics.write("signal.message_received", 1, {
         has_mention: hasExplicitMentions ? "true" : "false",
         target_count: String(targetAgentIds.length),
+        image_count: String(contentBlocks.filter((b) => b.type === "image").length),
     });
     const senderNumber = config.defaultRecipientNumber || payload.sender;
     if (hasExplicitMentions && targetAgents.length === 0) {
@@ -786,7 +930,15 @@ async function handleSignalMessage(payload) {
             });
             pending.sessionIds.push(session.sessionId);
             await setPending(pending);
-            await ctx.agents.sessions.sendMessage(session.sessionId, companyId, {
+            const sendOpts: {
+                prompt: string;
+                reason?: string;
+                onEvent?: (event: any) => void;
+                contentBlocks?: Array<
+                    | { type: "text"; text: string }
+                    | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
+                >;
+            } = {
                 prompt: quotePrefix + payload.message,
                 reason: `Signal message from ${maskSender(payload.sender)}`,
                 onEvent: (event) => {
@@ -800,7 +952,17 @@ async function handleSignalMessage(payload) {
                         });
                     }
                 },
-            });
+            };
+            // Attach image content blocks if present
+            if (contentBlocks.length > 0) {
+                sendOpts.contentBlocks = contentBlocks;
+                ctx.logger.info("Attaching image content blocks to agent session message", {
+                    messageId: msgId,
+                    agentId,
+                    imageCount: contentBlocks.length,
+                });
+            }
+            await ctx.agents.sessions.sendMessage(session.sessionId, companyId, sendOpts);
             // Fire 👀 after session message dispatch — the agent is now processing.
             // fireEyesReaction is idempotent (no-ops if already sent), so this is
             // safe even if the issue.checked_out event fires first.
@@ -1117,13 +1279,18 @@ const plugin = definePlugin({
             await handleSignalReaction(payload.sender, payload.reaction);
             return;
         }
-        if (!payload?.message) {
-            ctx.logger.warn("Webhook payload missing message and reaction fields", {
+        const hasAttachments = Array.isArray(payload?.attachments) && payload.attachments.length > 0;
+        if (!payload?.message && !hasAttachments) {
+            ctx.logger.warn("Webhook payload missing message, attachments, and reaction fields", {
                 requestId: input.requestId,
             });
             return;
         }
-        // At this point message is guaranteed — safe to treat as SignalInboundMessage
+        // Ensure message is at least an empty string when only attachments are present
+        if (!payload.message && hasAttachments) {
+            payload.message = "";
+        }
+        // At this point message is guaranteed (possibly empty with attachments) — safe to handle
         await handleSignalMessage(payload);
     },
     async onConfigChanged() {
