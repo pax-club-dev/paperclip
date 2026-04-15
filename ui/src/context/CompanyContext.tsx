@@ -12,6 +12,7 @@ import type { Company } from "@paperclipai/shared";
 import { companiesApi } from "../api/companies";
 import { ApiError } from "../api/client";
 import { queryKeys } from "../lib/queryKeys";
+import { useEnvironment } from "./EnvironmentContext";
 import type { CompanySelectionSource } from "../lib/company-selection";
 type CompanySelectionOptions = { source?: CompanySelectionSource };
 
@@ -37,6 +38,7 @@ const CompanyContext = createContext<CompanyContextValue | null>(null);
 
 export function CompanyProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
+  const { activeEnvironment } = useEnvironment();
   const [selectionSource, setSelectionSource] = useState<CompanySelectionSource>("bootstrap");
   const [selectedCompanyId, setSelectedCompanyIdState] = useState<string | null>(() => localStorage.getItem(STORAGE_KEY));
 
@@ -59,11 +61,16 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
     [companies],
   );
 
-  // Auto-select first company when list loads
+  const environmentCompanies = useMemo(
+    () => sidebarCompanies.filter((company) => company.environment === activeEnvironment),
+    [sidebarCompanies, activeEnvironment],
+  );
+
+  // Auto-select first company in the active environment when list loads
   useEffect(() => {
     if (companies.length === 0) return;
 
-    const selectableCompanies = sidebarCompanies.length > 0 ? sidebarCompanies : companies;
+    const selectableCompanies = environmentCompanies.length > 0 ? environmentCompanies : sidebarCompanies.length > 0 ? sidebarCompanies : companies;
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored && selectableCompanies.some((c) => c.id === stored)) return;
     if (selectedCompanyId && selectableCompanies.some((c) => c.id === selectedCompanyId)) return;
@@ -72,7 +79,21 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
     setSelectedCompanyIdState(next);
     setSelectionSource("bootstrap");
     localStorage.setItem(STORAGE_KEY, next);
-  }, [companies, selectedCompanyId, sidebarCompanies]);
+  }, [companies, selectedCompanyId, sidebarCompanies, environmentCompanies]);
+
+  // Enforce: selected company must belong to the active environment
+  useEffect(() => {
+    if (!selectedCompanyId || companies.length === 0) return;
+    const selected = companies.find((c) => c.id === selectedCompanyId);
+    if (!selected || selected.environment === activeEnvironment) return;
+    const envCompanies = environmentCompanies;
+    if (envCompanies.length > 0) {
+      const next = envCompanies[0]!.id;
+      setSelectedCompanyIdState(next);
+      setSelectionSource("bootstrap");
+      localStorage.setItem(STORAGE_KEY, next);
+    }
+  }, [activeEnvironment, selectedCompanyId, companies, environmentCompanies]);
 
   const setSelectedCompanyId = useCallback((companyId: string, options?: CompanySelectionOptions) => {
     setSelectedCompanyIdState(companyId);

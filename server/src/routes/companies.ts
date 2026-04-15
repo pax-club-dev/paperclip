@@ -2,6 +2,7 @@ import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_FEEDBACK_DATA_SHARING_TERMS_VERSION,
+  cloneToEnvironmentSchema,
   companyPortabilityExportSchema,
   companyPortabilityImportSchema,
   companyPortabilityPreviewSchema,
@@ -78,13 +79,19 @@ export function companyRoutes(db: Db, storage?: StorageService) {
 
   router.get("/", async (req, res) => {
     assertBoard(req);
+    const environmentFilter = typeof req.query.environment === "string" && req.query.environment.trim().length > 0
+      ? req.query.environment.trim()
+      : undefined;
     const result = await svc.list();
+    const envFiltered = environmentFilter
+      ? result.filter((company) => company.environment === environmentFilter)
+      : result;
     if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) {
-      res.json(result);
+      res.json(envFiltered);
       return;
     }
     const allowed = new Set(req.actor.companyIds ?? []);
-    res.json(result.filter((company) => allowed.has(company.id)));
+    res.json(envFiltered.filter((company) => allowed.has(company.id)));
   });
 
   router.get("/stats", async (req, res) => {
@@ -106,6 +113,12 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     res.status(400).json({
       error: "Missing companyId in path. Use /api/companies/{companyId}/issues.",
     });
+  });
+
+  router.get("/environments", async (req, res) => {
+    assertBoard(req);
+    const environments = await svc.listEnvironments();
+    res.json(environments);
   });
 
   router.get("/:companyId", async (req, res) => {
@@ -149,6 +162,29 @@ export function companyRoutes(db: Db, storage?: StorageService) {
       includePayload: parseBooleanQuery(req.query.includePayload),
     });
     res.json(traces);
+  });
+
+  router.post("/:companyId/clone-to-environment", validate(cloneToEnvironmentSchema), async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (!(req.actor.source === "local_implicit" || req.actor.isInstanceAdmin)) {
+      throw forbidden("Instance admin required");
+    }
+    const { environment } = req.body;
+    const cloned = await svc.cloneToEnvironment(companyId, environment);
+    await access.ensureMembership(cloned.id, "user", req.actor.userId ?? "local-board", "owner", "active");
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: cloned.id,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      action: "company.cloned_to_environment",
+      entityType: "company",
+      entityId: cloned.id,
+      details: { sourceCompanyId: companyId, environment },
+    });
+    res.status(201).json(cloned);
   });
 
   router.post("/:companyId/export", validate(companyPortabilityExportSchema), async (req, res) => {

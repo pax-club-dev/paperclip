@@ -263,7 +263,19 @@ export function NewIssueDialog() {
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const executionWorkspaceDefaultProjectId = useRef<string | null>(null);
 
-  const effectiveCompanyId = dialogCompanyId ?? selectedCompanyId;
+  const environmentSafeCompanyId = useMemo(() => {
+    if (dialogCompanyId) return dialogCompanyId;
+    if (selectedCompanyId) {
+      const selected = companies.find((c) => c.id === selectedCompanyId);
+      if (selected && selected.environment === activeEnvironment) return selectedCompanyId;
+    }
+    const envCompanies = companies.filter(
+      (c) => c.status !== "archived" && c.environment === activeEnvironment,
+    );
+    return envCompanies[0]?.id ?? null;
+  }, [dialogCompanyId, selectedCompanyId, companies, activeEnvironment]);
+
+  const effectiveCompanyId = environmentSafeCompanyId;
   const dialogCompany = companies.find((c) => c.id === effectiveCompanyId) ?? selectedCompany;
 
   // Popover states
@@ -604,6 +616,8 @@ export function NewIssueDialog() {
 
   function handleSubmit() {
     if (!effectiveCompanyId || !title.trim() || createIssue.isPending) return;
+    const targetCompany = companies.find((c) => c.id === effectiveCompanyId);
+    if (targetCompany && targetCompany.environment !== activeEnvironment) return;
     const assigneeAdapterOverrides = buildAssigneeAdapterOverrides({
       adapterType: assigneeAdapterType,
       modelOverride: assigneeModelOverride,
