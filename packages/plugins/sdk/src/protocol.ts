@@ -670,7 +670,16 @@ export interface WorkerToHostMethods {
     result: Array<{ sessionId: string; agentId: string; companyId: string; status: "active" | "closed"; createdAt: string }>,
   ];
   "agents.sessions.sendMessage": [
-    params: { sessionId: string; companyId: string; prompt: string; reason?: string },
+    params: {
+      sessionId: string;
+      companyId: string;
+      prompt: string;
+      reason?: string;
+      contentBlocks?: Array<
+        | { type: "text"; text: string }
+        | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
+      >;
+    },
     result: { runId: string },
   ];
   "agents.sessions.close": [

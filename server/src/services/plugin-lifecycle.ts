@@ -783,7 +783,10 @@ export function pluginLifecycleManager(
 
       await handle.restart();
 
-      emitDomain("plugin.worker_stopped", { pluginId, pluginKey: plugin.pluginKey });
+      // NOTE: Do NOT emit plugin.worker_stopped here. The restart reuses the
+      // same host handler closures, so emitting worker_stopped would dispose the
+      // host services that the newly restarted worker is actively using — causing
+      // every subsequent RPC call to fail with "Host services have been disposed".
       emitDomain("plugin.worker_started", { pluginId, pluginKey: plugin.pluginKey });
 
       log.info(

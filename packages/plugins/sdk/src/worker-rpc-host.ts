@@ -685,6 +685,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             prompt: string;
             reason?: string;
             onEvent?: (event: AgentSessionEvent) => void;
+            contentBlocks?: Array<
+              | { type: "text"; text: string }
+              | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
+            >;
           }) {
             if (opts.onEvent) {
               sessionEventCallbacks.set(sessionId, opts.onEvent);
@@ -695,6 +699,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
                 companyId,
                 prompt: opts.prompt,
                 reason: opts.reason,
+                contentBlocks: opts.contentBlocks,
               });
             } catch (err) {
               sessionEventCallbacks.delete(sessionId);
